@@ -1,0 +1,28 @@
+{
+  "name": "早间预约",
+  "venue": "基础馆",
+  "floor": "负一层",
+  "area": "负一层书库",
+  "reservation_date": "2026-06-15",
+  "time_slot": "08:00-22:00",
+  "starts_at": "2026-06-14T07:59:50+08:00",
+  "stops_at": "2026-06-14T08:10:00+08:00",
+  "refresh_min_seconds": 8,
+  "refresh_max_seconds": 15,
+  "max_consecutive_errors": 5,
+  "observation_mode": true,
+  "notify_success": true,
+  "notify_timeout": true,
+  "notify_error": true,
+  "seat_rules": [
+    {
+      "priority": 1,
+      "start": 80,
+      "end": 100,
+      "included": [12],
+      "excluded": [91],
+      "accept_any": false,
+      "order": "asc"
+    }
+  ]
+}

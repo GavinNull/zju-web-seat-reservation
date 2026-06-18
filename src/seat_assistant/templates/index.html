@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>浙大图书馆座位助手</title>
+  <link rel="stylesheet" href="/static/app.css?v=20260615-2">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">LOCAL CONTROL CONSOLE</p>
+      <h1>浙大图书馆座位助手</h1>
+      <p>任务、座位范围、屏幕通知和自动提交都可以在这里设置。</p>
+    </div>
+    <div class="header-actions">
+      <button id="login-button" class="secondary">连接浙大账号</button>
+      <button id="verify-login-button" class="secondary">我已完成登录</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="status-grid">
+      <article><span>账号</span><strong id="account-status">读取中</strong></article>
+      <article><span>自动提交</span><strong id="submission-status">关闭</strong></article>
+      <article><span>任务数</span><strong id="task-count">0</strong></article>
+      <article><span>最近预约</span><strong id="reservation-count">0</strong></article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title">
+        <div><p class="eyebrow">TASKS</p><h2>预约任务</h2></div>
+        <button id="new-task">新建任务</button>
+      </div>
+      <div id="tasks" class="task-list"></div>
+    </section>
+
+    <section class="settings-grid">
+      <article class="panel danger-panel">
+        <p class="eyebrow">SYSTEM</p>
+        <h2>自动提交总开关</h2>
+        <p>默认关闭。开启后，只有同时关闭任务的观察模式，程序才会点击“立即预约”。</p>
+        <label class="check">
+          <input id="submission-enabled" type="checkbox">
+          允许任务自动提交预约
+        </label>
+        <label>开启确认短语
+          <input id="submission-confirmation" placeholder="确认自动预约" autocomplete="off">
+        </label>
+        <p class="hint">开启时必须输入：<strong>确认自动预约</strong></p>
+        <p id="system-error" class="error"></p>
+        <button id="save-system">保存系统设置</button>
+      </article>
+    </section>
+  </main>
+
+  <dialog id="task-dialog">
+    <form id="task-form">
+      <div class="dialog-title">
+        <div><p class="eyebrow">RESERVATION</p><h2>预约任务</h2></div>
+        <button type="button" id="close-dialog" class="text">关闭</button>
+      </div>
+      <input type="hidden" name="id">
+
+      <h3>地点与时间</h3>
+      <div class="location-grid">
+        <section class="location-picker">
+          <div class="picker-heading">
+            <strong>馆舍选择</strong>
+            <label>选择方式
+              <select id="venue-mode">
+                <option value="single">单选</option>
+                <option value="multiple">多选</option>
+              </select>
+            </label>
+          </div>
+          <div id="venue-options" class="option-chips"></div>
+        </section>
+        <section class="location-picker">
+          <div class="picker-heading">
+            <strong>楼层选择</strong>
+            <label>选择方式
+              <select id="floor-mode">
+                <option value="single">单选</option>
+                <option value="multiple">多选</option>
+              </select>
+            </label>
+          </div>
+          <div id="floor-options" class="option-chips"></div>
+        </section>
+        <section class="location-picker">
+          <div class="picker-heading">
+            <strong>分区选择</strong>
+            <label>选择方式
+              <select id="area-mode">
+                <option value="single">单选</option>
+                <option value="multiple">多选</option>
+              </select>
+            </label>
+          </div>
+          <div id="area-options" class="option-chips"></div>
+        </section>
+      </div>
+      <p class="hint">选项来自已读取的网页数据。多选分区保存时会分别建立预约任务。</p>
+      <div class="form-grid">
+        <label>任务名称<input name="name" required value="早间预约"></label>
+        <label>预约日期<input name="reservation_date" type="date" required></label>
+        <label>使用开始时间<input name="use_start" type="time" value="08:00" required></label>
+        <label>使用结束时间<input name="use_end" type="time" value="22:00" required></label>
+        <span></span>
+        <label>自动检查开始<input name="starts_at" type="datetime-local" required></label>
+        <label>自动检查停止<input name="stops_at" type="datetime-local" required></label>
+      </div>
+
+      <h3>检查策略</h3>
+      <div class="form-grid three">
+        <label>最小刷新秒数<input name="refresh_min_seconds" type="number" min="8" value="8"></label>
+        <label>最大刷新秒数<input name="refresh_max_seconds" type="number" min="8" value="15"></label>
+        <label>最大连续错误<input name="max_consecutive_errors" type="number" min="1" value="5"></label>
+      </div>
+
+      <div class="section-title">
+        <div><h3>座位规则</h3><p>按优先级从上到下检查。</p></div>
+        <button type="button" id="add-rule" class="secondary">添加规则</button>
+      </div>
+      <div id="seat-rules"></div>
+
+      <h3>模式与屏幕通知</h3>
+      <div class="checks">
+        <label class="check"><input name="direct_submit" type="checkbox"> 发现空位后直接预约</label>
+        <label class="check"><input name="notify_success" type="checkbox" checked> 预约成功时弹出屏幕提示</label>
+        <label class="check"><input name="notify_timeout" type="checkbox" checked> 任务超时时弹出屏幕提示</label>
+        <label class="check"><input name="notify_error" type="checkbox" checked> 任务异常时弹出屏幕提示</label>
+      </div>
+      <p class="hint">只有同时开启“自动提交总开关”并勾选“发现空位后直接预约”，程序才会点击“立即预约”。</p>
+
+      <p id="form-error" class="error"></p>
+      <button type="submit">保存任务</button>
+    </form>
+  </dialog>
+
+  <template id="seat-rule-template">
+    <article class="rule-card">
+      <div class="rule-heading">
+        <strong>座位规则 <span class="rule-number"></span></strong>
+        <button type="button" class="remove-rule text">删除</button>
+      </div>
+      <div class="form-grid three">
+        <label>优先级<input data-field="priority" type="number" min="0" value="1"></label>
+        <label>座位起始<input data-field="start" type="number" min="1" value="1"></label>
+        <label>座位结束<input data-field="end" type="number" min="1" value="999"></label>
+        <label>指定座位<input data-field="included" placeholder="85, 91, 110"></label>
+        <label>排除座位<input data-field="excluded" placeholder="22, 23"></label>
+        <label>选择顺序
+          <select data-field="order">
+            <option value="asc">升序</option>
+            <option value="desc">降序</option>
+            <option value="random">随机</option>
+          </select>
+        </label>
+      </div>
+      <label class="check"><input data-field="accept_any" type="checkbox"> 接受区域内任意空闲座位</label>
+    </article>
+  </template>
+
+  <div id="toast" role="status"></div>
+  <script src="/static/app.js?v=20260615-2"></script>
+</body>
+</html>

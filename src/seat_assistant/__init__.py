@@ -1,0 +1,2 @@
+"""Local DingTalk seat assistant."""
+

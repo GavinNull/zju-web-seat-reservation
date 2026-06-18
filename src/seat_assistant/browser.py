@@ -1,0 +1,550 @@
+﻿"""Playwright adapter for the ZJU library reservation website.
+
+All unstable page knowledge is isolated in this module. The defaults prefer
+visible Chinese text. CSS selectors can be overridden after inspecting the
+authenticated page without changing scheduler or domain code.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from .domain import (
+    ReservationConfig,
+    ReservationOutcome,
+    classify_result_message,
+)
+from .engine import ScanResult
+
+
+HOME_URL = "https://booking.lib.zju.edu.cn/h5/index.html#/home"
+SEAT_SELECT_URL = (
+    "https://booking.lib.zju.edu.cn/h5/index.html"
+    "#/SeatScreening/1/seatSelect"
+)
+LOGIN_READY_TIMEOUT_MS = 8000
+LOGIN_POLL_INTERVAL_MS = 500
+FILTER_PANEL_TIMEOUT_MS = 8000
+FILTER_PANEL_POLL_INTERVAL_MS = 500
+SEAT_SCAN_TIMEOUT_SECONDS = 25
+SEAT_PROBE_CLICK_TIMEOUT_MS = 800
+_SEAT_NUMBER = re.compile(r"(?<!\d)(\d{1,4})(?!\d)")
+_SELECTED_SEAT_VALUE = re.compile(r"已选座位号")
+_SELECTED_SEAT_NUMBER = re.compile(r"已选座位号")
+
+
+@dataclass(frozen=True)
+class SelectorConfig:
+    seat_entry_text: str = "座位预约"
+    list_mode_text: str = "列表模式"
+    submit_text: str = "立即预约"
+    success_text: str = "预约成功"
+    current_reservation_text: str = "当前预约"
+    login_markers: tuple[str, ...] = (
+        "我的中心",
+    )
+    room_item_css: str = ".roomItem"
+    seat_item_css: str = (
+        ".absolute, [data-seat-no], .seat-item, .seat-list-item"
+    )
+    available_css: str = (
+        "[data-status='available'], .available, .can-select, "
+        ":not(.disabled):not(.occupied)"
+    )
+    selected_css: str = ".selected, [aria-selected='true']"
+
+
+def parse_seat_number(label: str) -> int | None:
+    match = _SEAT_NUMBER.search(label)
+    return int(match.group(1)) if match else None
+
+
+def parse_selected_seat_number(body_text: str) -> int | None:
+    match = _SELECTED_SEAT_VALUE.search("".join(body_text.split()))
+    if not match:
+        return None
+    digit_groups = re.findall(r"\d{1,4}", match.string[match.end() : match.end() + 24])
+    return int(digit_groups[-1]) if digit_groups else None
+
+
+def _is_closed(page: Any) -> bool:
+    try:
+        closed = page.is_closed()
+    except AttributeError:
+        return False
+    except Exception:
+        return True
+    return closed is True
+
+
+def _text_count(page: Any, marker: str) -> int:
+    try:
+        count = page.get_by_text(marker, exact=False).count()
+    except Exception:
+        return 0
+    return count if isinstance(count, int) else 0
+
+
+def area_card_matches(
+    card_text: str, venue: str, floor: str, area: str
+) -> bool:
+    lines = {line.strip() for line in card_text.splitlines() if line.strip()}
+    return {venue, floor, area}.issubset(lines)
+
+
+def single_area_card_matches(
+    card_text: str, venue: str, floor: str, area: str
+) -> bool:
+    if not area_card_matches(card_text, venue, floor, area):
+        return False
+    return card_text.count("预约") <= 1
+
+
+class PlaywrightAdapter:
+    def __init__(
+        self,
+        profile_directory: Path,
+        diagnostics_directory: Path,
+        selectors: SelectorConfig | None = None,
+        headless: bool = True,
+        background_window: bool = False,
+    ):
+        self.profile_directory = Path(profile_directory)
+        self.diagnostics_directory = Path(diagnostics_directory)
+        self.selectors = selectors or SelectorConfig()
+        self.headless = headless
+        self.background_window = background_window
+        self._playwright: Any = None
+        self._context: Any = None
+        self._page: Any = None
+
+    def open_for_login(self) -> None:
+        page = self._ensure_page()
+        page.goto(HOME_URL, wait_until="domcontentloaded")
+        page.bring_to_front()
+
+    def check_login(self, navigate: bool = True) -> bool:
+        page = self._ensure_page()
+        if navigate:
+            page.goto(HOME_URL, wait_until="domcontentloaded")
+        body_text = ""
+        attempts = max(1, LOGIN_READY_TIMEOUT_MS // LOGIN_POLL_INTERVAL_MS)
+        for _ in range(attempts):
+            page = self._ensure_page()
+            body_text = ""
+            try:
+                body_text = page.locator("body").inner_text()
+            except Exception:
+                pass
+            if not isinstance(body_text, str):
+                body_text = ""
+            recognized = any(
+                marker in body_text or _text_count(page, marker) > 0
+                for marker in self.selectors.login_markers
+            )
+            if recognized:
+                return True
+            page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
+        self._save_diagnostic("login-check-failed", body_text=body_text)
+        return False
+
+    def scan(self, config: ReservationConfig) -> ScanResult:
+        page = self._ensure_page()
+        try:
+            self._open_area(config)
+            while True:
+                seats = self._scan_current_seat_page()
+                if seats:
+                    return ScanResult(tuple(sorted(set(seats))))
+                now = datetime.now()
+                if now >= config.stops_at:
+                    return ScanResult((), "no available seat before stop time")
+                self._refresh_current_seat_page(config)
+        except Exception:
+            body_text = ""
+            try:
+                body_text = page.locator("body").inner_text()
+            except Exception:
+                pass
+            self._save_diagnostic("scan-error", body_text=body_text)
+            raise
+
+    def _scan_current_seat_page(self) -> list[int]:
+        page = self._ensure_page()
+        seats: list[int] = []
+        items = page.locator(self.selectors.seat_item_css)
+        deadline = datetime.now().timestamp() + SEAT_SCAN_TIMEOUT_SECONDS
+        for index in range(items.count()):
+            if datetime.now().timestamp() >= deadline:
+                if seats:
+                    return seats
+                raise TimeoutError("seat scan timed out")
+            item = items.nth(index)
+            if self._seat_unavailable(item):
+                continue
+            number = self._explicit_seat_number(item)
+            if number is None:
+                number = self._probe_seat_number(item)
+            if number is not None:
+                seats.append(number)
+        return seats
+
+    def _refresh_current_seat_page(self, config: ReservationConfig) -> None:
+        page = self._ensure_page()
+        wait_ms = int(max(1.0, config.refresh_min_seconds) * 1000)
+        page.wait_for_timeout(wait_ms)
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_timeout(800)
+        heading = f"{config.venue}-{config.floor}-{config.area}"
+        if not page.get_by_text(heading, exact=True).count():
+            self._open_area(config)
+
+    def submit(
+        self, config: ReservationConfig, seat: int
+    ) -> ReservationOutcome:
+        page = self._ensure_page()
+        try:
+            self._select_seat(seat)
+            after = page.locator("body").inner_text()
+            if parse_selected_seat_number(after) != seat:
+                raise RuntimeError("selected seat could not be verified")
+            page.get_by_role(
+                "button", name=self.selectors.submit_text, exact=True
+            ).click()
+            page.wait_for_timeout(1000)
+            body_text = page.locator("body").inner_text()
+            return classify_result_message(body_text)
+        except Exception:
+            self._save_diagnostic("submit-error")
+            raise
+
+    def verify_current_reservation(
+        self, config: ReservationConfig, seat: int
+    ) -> bool:
+        page = self._ensure_page()
+        page.goto(HOME_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(800)
+        body = page.locator("body").inner_text()
+        return (
+            self.selectors.current_reservation_text in body
+            and str(seat) in body
+            and config.area in body
+        )
+
+    def close(self) -> None:
+        if self._context is not None:
+            self._context.close()
+        if self._playwright is not None:
+            self._playwright.stop()
+        self._page = self._context = self._playwright = None
+
+    def _ensure_page(self) -> Any:
+        if self._page is not None and not _is_closed(self._page):
+            return self._page
+        if self._context is not None:
+            for page in reversed(self._context.pages):
+                if not _is_closed(page):
+                    self._page = page
+                    return self._page
+            self._page = self._context.new_page()
+            return self._page
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as error:
+            raise RuntimeError(
+                "Playwright is not installed; install the project and run "
+                '`playwright install chromium`'
+            ) from error
+        self.profile_directory.mkdir(parents=True, exist_ok=True)
+        self._playwright = sync_playwright().start()
+        args = (
+            ["--window-position=-32000,-32000", "--window-size=1280,900"]
+            if self.background_window
+            else None
+        )
+        self._context = self._playwright.chromium.launch_persistent_context(
+            str(self.profile_directory),
+            headless=self.headless,
+            viewport={"width": 1280, "height": 900},
+            args=args,
+        )
+        self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+        return self._page
+
+    def _open_area(self, config: ReservationConfig) -> None:
+        page = self._ensure_page()
+        page.set_viewport_size({"width": 1280, "height": 900})
+        self._open_seat_reservation_panel(config)
+        page = self._ensure_page()
+        if "login" in page.url.casefold() or "sso" in page.url.casefold():
+            raise RuntimeError("login required")
+
+        self._clear_location_filters()
+        self._select_date_filter(config)
+        self._expand_filter("馆舍", config.venue)
+        self._left_option(config.venue).click()
+        page.wait_for_timeout(600)
+        if config.floor:
+            self._expand_filter("楼层", config.floor)
+            self._left_option(config.floor).click()
+            page.wait_for_timeout(900)
+
+        self._click_room_card(config)
+
+        detail_heading = f"{config.venue}-{config.floor}-{config.area}"
+        if not page.get_by_text(detail_heading, exact=True).count():
+            raise RuntimeError(f"area detail did not open: {detail_heading}")
+        self._detail_reservation_button().click()
+        page.wait_for_timeout(1200)
+        if not page.locator(".absolute").count():
+            raise RuntimeError("seat map did not open")
+
+    def _open_seat_reservation_panel(
+        self, config: ReservationConfig | None = None
+    ) -> None:
+        page = self._ensure_page()
+        url = SEAT_SELECT_URL
+        if config is not None:
+            url = f"{url}?date={config.reservation_date.isoformat()}"
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_timeout(1200)
+        if self._wait_for_left_option("馆舍", timeout_ms=1500):
+            return
+
+        entry = self._visible_text(self.selectors.seat_entry_text)
+        if entry is not None:
+            entry.click()
+            if self._wait_for_left_option("馆舍"):
+                return
+
+        page.goto(url, wait_until="domcontentloaded")
+        if self._wait_for_left_option("馆舍"):
+            return
+        raise RuntimeError("seat reservation entry did not open filter panel")
+
+    def _wait_for_left_option(
+        self,
+        text: str,
+        timeout_ms: int = FILTER_PANEL_TIMEOUT_MS,
+    ) -> bool:
+        page = self._ensure_page()
+        attempts = max(1, timeout_ms // FILTER_PANEL_POLL_INTERVAL_MS)
+        for _ in range(attempts):
+            if self._left_option_or_none(text) is not None:
+                return True
+            page.wait_for_timeout(FILTER_PANEL_POLL_INTERVAL_MS)
+        return False
+
+    def _visible_text(self, text: str) -> Any | None:
+        matches = self._ensure_page().get_by_text(text, exact=True)
+        for index in range(matches.count()):
+            item = matches.nth(index)
+            try:
+                if item.is_visible():
+                    return item
+            except Exception:
+                continue
+        return None
+
+    def _left_option(self, text: str) -> Any:
+        item = self._left_option_or_none(text)
+        if item is not None:
+            return item
+        raise RuntimeError(f"left filter option not found: {text}")
+
+    def _left_option_or_none(self, text: str) -> Any | None:
+        matches = self._ensure_page().get_by_text(text, exact=True)
+        for index in range(matches.count()):
+            item = matches.nth(index)
+            box = item.bounding_box(timeout=800)
+            if box and box["x"] < 320:
+                return item
+        return None
+
+    def _expand_filter(self, heading: str, option: str) -> None:
+        try:
+            self._left_option(option)
+        except RuntimeError:
+            self._left_option(heading).click()
+            self._ensure_page().wait_for_timeout(300)
+
+    def _clear_location_filters(self) -> None:
+        page = self._ensure_page()
+        for _ in range(30):
+            active = page.locator("div.selectItem.active")
+            target = None
+            for index in range(active.count()):
+                item = active.nth(index)
+                box = item.bounding_box(timeout=800)
+                if box and box["x"] < 320:
+                    target = item
+                    break
+            if target is None:
+                return
+            target.click()
+            page.wait_for_timeout(120)
+
+    def _select_date_filter(self, config: ReservationConfig) -> None:
+        date_text = config.reservation_date.isoformat()
+        try:
+            self._expand_filter("日期", date_text)
+            self._left_option(date_text).click()
+            self._ensure_page().wait_for_timeout(600)
+        except RuntimeError:
+            return
+
+    def _room_card(
+        self, config: ReservationConfig, timeout_seconds: float = 12
+    ) -> Any:
+        page = self._ensure_page()
+        deadline = datetime.now().timestamp() + timeout_seconds
+        while datetime.now().timestamp() < deadline:
+            cards = page.locator(self.selectors.room_item_css)
+            for index in range(cards.count()):
+                card = cards.nth(index)
+                if not card.is_visible():
+                    continue
+                try:
+                    card_text = card.inner_text(timeout=1000)
+                except Exception:
+                    continue
+                if single_area_card_matches(
+                    card_text, config.venue, config.floor, config.area
+                ):
+                    return card
+            page.wait_for_timeout(300)
+        raise RuntimeError(
+            "area card not found: "
+            f"{config.venue}/{config.floor}/{config.area}"
+        )
+
+    def _click_room_card(self, config: ReservationConfig) -> None:
+        page = self._ensure_page()
+        deadline = datetime.now().timestamp() + 15
+        last_error: Exception | None = None
+        while datetime.now().timestamp() < deadline:
+            try:
+                card = self._room_card(config, timeout_seconds=2)
+                card.scroll_into_view_if_needed()
+                self._click_room_card_entry(card)
+                page.wait_for_timeout(700)
+                return
+            except Exception as error:
+                last_error = error
+                page.wait_for_timeout(500)
+        raise RuntimeError(
+            "area card could not be clicked: "
+            f"{config.venue}/{config.floor}/{config.area}"
+        ) from last_error
+
+    def _click_room_card_entry(self, card: Any) -> None:
+        try:
+            buttons = card.get_by_role("button", name="预约", exact=True)
+            for index in range(buttons.count()):
+                button = buttons.nth(index)
+                if button.is_visible():
+                    button.click(timeout=3000)
+                    return
+        except Exception:
+            pass
+        card.click(timeout=3000)
+
+    def _detail_reservation_button(self) -> Any:
+        buttons = self._ensure_page().get_by_role(
+            "button", name="预约", exact=True
+        )
+        for index in range(buttons.count()):
+            button = buttons.nth(index)
+            box = button.bounding_box(timeout=800)
+            if box and box["x"] >= 790 and button.is_visible():
+                return button
+        raise RuntimeError("right-side reservation button not found")
+
+    def _seat_locator(self, seat: int) -> Any:
+        return self._select_seat(seat)
+
+    def _select_seat(self, seat: int) -> Any:
+        items = self._ensure_page().locator(self.selectors.seat_item_css)
+        for index in range(items.count()):
+            item = items.nth(index)
+            if self._seat_unavailable(item):
+                continue
+            number = self._explicit_seat_number(item)
+            if number == seat:
+                item.click(timeout=SEAT_PROBE_CLICK_TIMEOUT_MS)
+                self._ensure_page().wait_for_timeout(500)
+                if self._current_selected_seat_number() == seat:
+                    return item
+                continue
+            if number is not None:
+                continue
+            number = self._probe_seat_number(item)
+            if number == seat:
+                return item
+        raise RuntimeError(f"seat {seat} is no longer visible")
+
+    def _seat_unavailable(self, item: Any) -> bool:
+        class_name = item.get_attribute("class") or ""
+        status = item.get_attribute("data-status") or ""
+        disabled = item.get_attribute("aria-disabled") == "true"
+        if disabled or status in {"occupied", "disabled", "unavailable"}:
+            return True
+        return any(
+            word in class_name
+            for word in ("occupied", "disabled", "noSelectV2")
+        )
+
+    def _explicit_seat_number(self, item: Any) -> int | None:
+        return parse_seat_number(
+            item.get_attribute("data-seat-no") or item.inner_text()
+        )
+
+    def _probe_seat_number(self, item: Any) -> int | None:
+        try:
+            item.click(timeout=SEAT_PROBE_CLICK_TIMEOUT_MS)
+        except Exception:
+            return None
+        self._ensure_page().wait_for_timeout(300)
+        return self._current_selected_seat_number()
+
+    def _current_selected_seat_number(self) -> int | None:
+        return parse_selected_seat_number(
+            self._ensure_page().locator("body").inner_text()
+        )
+
+    def _save_diagnostic(self, prefix: str, body_text: str | None = None) -> None:
+        if self._page is None:
+            return
+        self.diagnostics_directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        screenshot_path = self.diagnostics_directory / f"{prefix}-{timestamp}.png"
+        try:
+            self._page.screenshot(path=str(screenshot_path), full_page=True)
+        except Exception:
+            pass
+        if body_text is None:
+            return
+        try:
+            title = self._page.title()
+        except Exception:
+            title = ""
+        try:
+            url = self._page.url
+        except Exception:
+            url = ""
+        text_path = self.diagnostics_directory / f"{prefix}-{timestamp}.txt"
+        text_path.write_text(
+            "\n".join(
+                [
+                    f"url: {url}",
+                    f"title: {title}",
+                    "",
+                    body_text[:5000],
+                ]
+            ),
+            encoding="utf-8",
+        )
