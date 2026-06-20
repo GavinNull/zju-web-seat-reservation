@@ -24,7 +24,9 @@
 首次运行时，启动助手会自动完成这些准备工作：
 
 - 切换到项目目录。
+- 检查系统是否能找到 Python。
 - 创建 `.venv` Python 虚拟环境。
+- 如果 `.venv` 缺少 `pip`，自动尝试修复。
 - 安装项目依赖。
 - 安装 Playwright Chromium。
 - 启动本地服务并打开 `http://127.0.0.1:8765`。
@@ -82,6 +84,12 @@ http://127.0.0.1:8765
 - PowerShell 或 Windows Terminal。
 - 可访问浙江大学图书馆预约网站的校园网、VPN 或校内网络环境。
 - 可正常完成浙大统一身份认证，包括密码、短信、App 或其他二次认证方式。
+
+如果双击 `启动助手.bat` 时提示找不到 Python，或 `.venv` 中没有 `pip`：
+
+1. 安装 Python 3.11 或更高版本，推荐从 [python.org](https://www.python.org/downloads/) 安装。
+2. 安装时勾选 `Add python.exe to PATH`。
+3. 如果项目目录里已经生成了坏的 `.venv` 文件夹，删除 `.venv` 后重新双击 `启动助手.bat`。
 
 Python 运行依赖由 `pyproject.toml` 管理，安装项目时会自动安装：
 

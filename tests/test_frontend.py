@@ -89,7 +89,10 @@ class FrontendContentTests(unittest.TestCase):
         launcher = (ROOT / "启动助手.bat").read_text(encoding="utf-8")
 
         self.assertIn('cd /d "%~dp0"', launcher)
-        self.assertIn("python -m venv .venv", launcher)
+        self.assertIn("where py", launcher)
+        self.assertIn("where python", launcher)
+        self.assertIn("%PYTHON_CMD% -m venv .venv", launcher)
+        self.assertIn("ensurepip --upgrade", launcher)
         self.assertIn('pip install -e ".[test]"', launcher)
         self.assertIn("playwright install chromium", launcher)
         self.assertIn("zju-seat-assistant.exe", launcher)

@@ -8,10 +8,24 @@ if not exist "pyproject.toml" (
   exit /b 1
 )
 
+set "PYTHON_CMD="
+where py >nul 2>nul
+if not errorlevel 1 set "PYTHON_CMD=py -3"
+if "%PYTHON_CMD%"=="" (
+  where python >nul 2>nul
+  if not errorlevel 1 set "PYTHON_CMD=python"
+)
+
 if not exist ".venv\Scripts\python.exe" (
+  if "%PYTHON_CMD%"=="" (
+    echo Python was not found.
+    echo Please install Python 3.11 or newer from https://www.python.org/downloads/
+    echo During installation, check "Add python.exe to PATH", then run this launcher again.
+    pause
+    exit /b 1
+  )
   echo Creating Python virtual environment...
-  py -3 -m venv .venv
-  if errorlevel 1 python -m venv .venv
+  %PYTHON_CMD% -m venv .venv
   if errorlevel 1 (
     echo Failed to create .venv. Please install Python 3.11 or newer.
     pause
@@ -19,8 +33,21 @@ if not exist ".venv\Scripts\python.exe" (
   )
 )
 
+".venv\Scripts\python.exe" -m pip --version >nul 2>nul
+if errorlevel 1 (
+  echo pip is missing in .venv. Trying to repair it...
+  ".venv\Scripts\python.exe" -m ensurepip --upgrade
+  if errorlevel 1 (
+    echo Failed to repair pip in .venv.
+    echo Please delete the .venv folder, install Python 3.11 or newer, then run this launcher again.
+    pause
+    exit /b 1
+  )
+)
+
 if not exist ".venv\Scripts\zju-seat-assistant.exe" (
   echo Installing project dependencies...
+  ".venv\Scripts\python.exe" -m pip install --upgrade pip
   ".venv\Scripts\python.exe" -m pip install -e ".[test]"
   if errorlevel 1 (
     echo Failed to install project dependencies.
