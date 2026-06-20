@@ -89,6 +89,14 @@ def _text_count(page: Any, marker: str) -> int:
     return count if isinstance(count, int) else 0
 
 
+def _window_args(background_window: bool, headless: bool) -> list[str] | None:
+    if headless:
+        return None
+    if background_window:
+        return ["--window-position=-32000,-32000", "--window-size=1280,900"]
+    return ["--window-position=120,80", "--window-size=1280,900"]
+
+
 def area_card_matches(
     card_text: str, venue: str, floor: str, area: str
 ) -> bool:
@@ -121,6 +129,7 @@ class PlaywrightAdapter:
         self._playwright: Any = None
         self._context: Any = None
         self._page: Any = None
+        self._current_area_key: tuple[str, str, str, str] | None = None
 
     def open_for_login(self) -> None:
         page = self._ensure_page()
@@ -155,15 +164,16 @@ class PlaywrightAdapter:
     def scan(self, config: ReservationConfig) -> ScanResult:
         page = self._ensure_page()
         try:
-            self._open_area(config)
-            while True:
-                seats = self._scan_current_seat_page()
-                if seats:
-                    return ScanResult(tuple(sorted(set(seats))))
-                now = datetime.now()
-                if now >= config.stops_at:
-                    return ScanResult((), "no available seat before stop time")
-                self._refresh_current_seat_page(config)
+            area_key = self._area_key(config)
+            if self._current_area_key == area_key:
+                self._reload_current_seat_page()
+            else:
+                self._open_area(config)
+                self._current_area_key = area_key
+            seats = self._scan_current_seat_page()
+            if seats:
+                return ScanResult(tuple(sorted(set(seats))))
+            return ScanResult((), "no available seat")
         except Exception:
             body_text = ""
             try:
@@ -197,11 +207,15 @@ class PlaywrightAdapter:
         page = self._ensure_page()
         wait_ms = int(max(1.0, config.refresh_min_seconds) * 1000)
         page.wait_for_timeout(wait_ms)
-        page.reload(wait_until="domcontentloaded")
-        page.wait_for_timeout(800)
+        self._reload_current_seat_page()
         heading = f"{config.venue}-{config.floor}-{config.area}"
         if not page.get_by_text(heading, exact=True).count():
             self._open_area(config)
+
+    def _reload_current_seat_page(self) -> None:
+        page = self._ensure_page()
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_timeout(500)
 
     def submit(
         self, config: ReservationConfig, seat: int
@@ -261,11 +275,7 @@ class PlaywrightAdapter:
             ) from error
         self.profile_directory.mkdir(parents=True, exist_ok=True)
         self._playwright = sync_playwright().start()
-        args = (
-            ["--window-position=-32000,-32000", "--window-size=1280,900"]
-            if self.background_window
-            else None
-        )
+        args = _window_args(self.background_window, self.headless)
         self._context = self._playwright.chromium.launch_persistent_context(
             str(self.profile_directory),
             headless=self.headless,
@@ -302,6 +312,14 @@ class PlaywrightAdapter:
         page.wait_for_timeout(1200)
         if not page.locator(".absolute").count():
             raise RuntimeError("seat map did not open")
+
+    def _area_key(self, config: ReservationConfig) -> tuple[str, str, str, str]:
+        return (
+            config.reservation_date.isoformat(),
+            config.venue,
+            config.floor,
+            config.area,
+        )
 
     def _open_seat_reservation_panel(
         self, config: ReservationConfig | None = None

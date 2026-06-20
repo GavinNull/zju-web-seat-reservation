@@ -42,6 +42,39 @@ class ReservationConfigTests(unittest.TestCase):
 
         self.assertEqual(choose_seat({12, 89, 91, 95}, rules), 95)
 
+    def test_allows_three_second_refresh_minimum(self) -> None:
+        config = ReservationConfig(
+            name="Morning",
+            venue="Library",
+            floor="Floor 1",
+            area="Area A",
+            reservation_date=date(2026, 6, 15),
+            time_slot="08:00-22:00",
+            starts_at=datetime(2026, 6, 14, 7, 59, 50),
+            stops_at=datetime(2026, 6, 14, 8, 10),
+            seat_rules=(SeatRule(priority=1, start=80, end=100),),
+            refresh_min_seconds=3,
+            refresh_max_seconds=5,
+        )
+
+        self.assertEqual(config.refresh_min_seconds, 3)
+
+    def test_rejects_refresh_minimum_below_three_seconds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least 3 seconds"):
+            ReservationConfig(
+                name="Morning",
+                venue="Library",
+                floor="Floor 1",
+                area="Area A",
+                reservation_date=date(2026, 6, 15),
+                time_slot="08:00-22:00",
+                starts_at=datetime(2026, 6, 14, 7, 59, 50),
+                stops_at=datetime(2026, 6, 14, 8, 10),
+                seat_rules=(SeatRule(priority=1, start=80, end=100),),
+                refresh_min_seconds=2.9,
+                refresh_max_seconds=5,
+            )
+
 
 class ReservationResultTests(unittest.TestCase):
     def test_classifies_chinese_result_messages(self) -> None:

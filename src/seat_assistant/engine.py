@@ -68,20 +68,65 @@ class ExecutionEngine:
                 self.repository.set_task_state(task_id, TaskState.SCHEDULED)
             self.repository.set_task_state(task_id, TaskState.RUNNING)
             run_id = self.repository.start_run(task_id)
+            self._event(
+                task_id,
+                "run_started",
+                "Started detection",
+                {
+                    "venue": task.config.venue,
+                    "floor": task.config.floor,
+                    "area": task.config.area,
+                },
+            )
 
+            self._event(task_id, "checking_login", "Checking login status")
             if not self.adapter.check_login():
+                self._event(task_id, "login_required", "Login is required")
                 return self._finish(
                     task_id, run_id, ReservationOutcome.LOGIN_REQUIRED
                 )
 
+            self._event(task_id, "scanning", "Scanning seats")
             scan = self.adapter.scan(task.config)
+            self._event(
+                task_id,
+                "scan_complete",
+                "Scan complete",
+                {
+                    "available_count": len(scan.available_seats),
+                    "available_seats": list(scan.available_seats[:30]),
+                    "message": scan.message,
+                },
+            )
             seat = choose_seat(scan.available_seats, task.config.seat_rules)
             if seat is None:
+                self._event(
+                    task_id,
+                    "no_matching_seat",
+                    "No matching seat found",
+                    {"available_count": len(scan.available_seats)},
+                )
                 return self._finish(
                     task_id, run_id, ReservationOutcome.NO_SEAT, message=scan.message
                 )
 
+            self._event(
+                task_id,
+                "candidate_found",
+                "Candidate seat found",
+                {"seat": seat},
+            )
             if task.config.observation_mode or not self.submission_enabled:
+                self._event(
+                    task_id,
+                    "submission_skipped",
+                    "Submission skipped by current settings",
+                    {
+                        "seat": seat,
+                        "observation_mode": task.config.observation_mode,
+                        "submission_enabled": self.submission_enabled,
+                    },
+                )
                 return self._finish(
                     task_id,
                     run_id,
@@ -91,8 +136,10 @@ class ExecutionEngine:
                 )
 
             self.repository.set_task_state(task_id, TaskState.SUBMITTING)
+            self._event(task_id, "submitting", "Submitting reservation", {"seat": seat})
             outcome = self.adapter.submit(task.config, seat)
             self.repository.set_task_state(task_id, TaskState.VERIFYING)
+            self._event(task_id, "verifying", "Verifying reservation", {"seat": seat})
             if outcome is ReservationOutcome.SUCCESS:
                 verified = self.adapter.verify_current_reservation(
                     task.config, seat
@@ -103,8 +150,20 @@ class ExecutionEngine:
                     self.repository.record_reservation(
                         task_id, run_id, str(seat), verified=True
                     )
+            self._event(
+                task_id,
+                "finished",
+                "Detection finished",
+                {"outcome": outcome.value, "seat": seat},
+            )
             return self._finish(task_id, run_id, outcome, seat=seat)
         except Exception as error:
+            self._event(
+                task_id,
+                "failed",
+                "Detection failed",
+                {"error": str(error)},
+            )
             if run_id is not None:
                 self.repository.finish_run(
                     run_id, ReservationOutcome.FAILURE.value, str(error)
@@ -120,6 +179,18 @@ class ExecutionEngine:
             )
         finally:
             self._account_lock.release()
+
+    def _event(
+        self,
+        task_id: str,
+        stage: str,
+        message: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            self.repository.add_task_event(task_id, stage, message, details)
+        except Exception:
+            return
 
     def _finish(
         self,

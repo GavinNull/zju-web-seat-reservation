@@ -48,7 +48,51 @@ class FrontendContentTests(unittest.TestCase):
         self.assertIn("本任务会点击立即预约", script)
         self.assertIn("最近检测", script)
         self.assertIn("下次检测", script)
+        self.assertIn("当前步骤", script)
+        self.assertIn("检测轮次", script)
+        self.assertIn("查看最近过程", script)
+        self.assertIn("当前空余", script)
+        self.assertIn("可用座位", script)
+        self.assertIn("候选座位", script)
+        self.assertIn("seat_status", script)
         self.assertIn("2000", script)
+
+        html = (
+            ROOT / "src" / "seat_assistant" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("每轮检测完成后会立即进入下一轮", html)
+        self.assertIn('name="refresh_min_seconds" type="hidden"', html)
+
+    def test_new_task_defaults_reservation_date_to_today(self) -> None:
+        script = (
+            ROOT / "src" / "seat_assistant" / "static" / "app.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("taskForm.elements.reservation_date.value = localDate(now)", script)
+        self.assertNotIn("taskForm.elements.reservation_date.value = localDate(tomorrow)", script)
+
+    def test_page_uses_centered_app_shell_layout(self) -> None:
+        html = (
+            ROOT / "src" / "seat_assistant" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        styles = (
+            ROOT / "src" / "seat_assistant" / "static" / "app.css"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('<body class="app-shell">', html)
+        self.assertIn('<header class="hero">', html)
+        self.assertIn("body.app-shell", styles)
+        self.assertIn("header.hero", styles)
+        self.assertIn("width: min(1280px, calc(100% - 48px))", styles)
+
+    def test_launcher_bootstraps_environment(self) -> None:
+        launcher = (ROOT / "启动助手.bat").read_text(encoding="utf-8")
+
+        self.assertIn('cd /d "%~dp0"', launcher)
+        self.assertIn("python -m venv .venv", launcher)
+        self.assertIn('pip install -e ".[test]"', launcher)
+        self.assertIn("playwright install chromium", launcher)
+        self.assertIn("zju-seat-assistant.exe", launcher)
 
     def test_location_options_match_collected_site_data(self) -> None:
         script = (

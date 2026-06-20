@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 from seat_assistant.browser import (
     PlaywrightAdapter,
     SelectorConfig,
+    _window_args,
     area_card_matches,
     parse_seat_number,
     parse_selected_seat_number,
@@ -31,6 +32,21 @@ class BrowserHelpersTests(unittest.TestCase):
         adapter = PlaywrightAdapter("profile", "diagnostics")
 
         self.assertTrue(adapter.headless)
+
+    def test_visible_login_browser_uses_stable_window_position(self) -> None:
+        self.assertEqual(
+            _window_args(background_window=False, headless=False),
+            ["--window-position=120,80", "--window-size=1280,900"],
+        )
+
+    def test_background_browser_stays_offscreen(self) -> None:
+        self.assertEqual(
+            _window_args(background_window=True, headless=False),
+            ["--window-position=-32000,-32000", "--window-size=1280,900"],
+        )
+
+    def test_headless_browser_does_not_need_window_args(self) -> None:
+        self.assertIsNone(_window_args(background_window=True, headless=True))
 
     def test_matches_room_card_by_complete_location(self) -> None:
         text = "基础馆\n二层书库\n二层\n座 位 160空闲 159\n预约"
@@ -102,7 +118,7 @@ class BrowserHelpersTests(unittest.TestCase):
         self.assertEqual(result.available_seats, (243,))
         self.assertEqual(result.message, "")
 
-    def test_scan_stays_on_current_seat_page_and_reloads_until_seat_appears(self) -> None:
+    def test_scan_returns_no_seat_without_waiting_for_internal_refresh(self) -> None:
         page = FakeRefreshingSeatPage(
             [
                 [],
@@ -122,7 +138,34 @@ class BrowserHelpersTests(unittest.TestCase):
 
         result = adapter.scan(config)
 
-        self.assertEqual(result.available_seats, (243,))
+        self.assertEqual(result.available_seats, ())
+        self.assertEqual(result.message, "no available seat")
+        self.assertEqual(page.reloads, 0)
+        adapter._open_area.assert_called_once()
+
+    def test_repeated_scan_keeps_same_seat_page_and_reloads_before_reading(self) -> None:
+        page = FakeRefreshingSeatPage(
+            [
+                [],
+                [FakeSeatElement("243", "absolute", "")],
+            ]
+        )
+        adapter = PlaywrightAdapter("profile", "diagnostics")
+        adapter._page = page
+        adapter._open_area = Mock(side_effect=lambda _config: page.mark_area_open())
+        config = Mock(
+            venue="主馆",
+            floor="三层",
+            area="三层北",
+            stops_at=datetime(2099, 1, 1, 0, 0, 0),
+            refresh_min_seconds=8,
+        )
+
+        first = adapter.scan(config)
+        second = adapter.scan(config)
+
+        self.assertEqual(first.available_seats, ())
+        self.assertEqual(second.available_seats, (243,))
         self.assertEqual(page.reloads, 1)
         adapter._open_area.assert_called_once()
 
@@ -523,7 +566,11 @@ class FakeRefreshingSeatPage(FakeSeatPage):
     def __init__(self, item_sets):
         self.item_sets = item_sets
         self.reloads = 0
+        self.area_open = False
         super().__init__(self.item_sets[0])
+
+    def mark_area_open(self) -> None:
+        self.area_open = True
 
     def reload(self, **_kwargs) -> None:
         self.reloads += 1

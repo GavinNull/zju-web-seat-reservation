@@ -74,6 +74,14 @@ class Repository:
                 verified INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS task_events (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                stage TEXT NOT NULL,
+                message TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -118,17 +126,19 @@ class Repository:
             raise KeyError(task_id)
 
     def get_task(self, task_id: str) -> StoredTask:
-        row = self._connection.execute(
-            "SELECT * FROM tasks WHERE id=?", (task_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
         if row is None:
             raise KeyError(task_id)
         return _row_to_task(row)
 
     def list_tasks(self) -> list[StoredTask]:
-        rows = self._connection.execute(
-            "SELECT * FROM tasks ORDER BY created_at DESC"
-        ).fetchall()
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM tasks ORDER BY created_at DESC"
+            ).fetchall()
         return [_row_to_task(row) for row in rows]
 
     def delete_task(self, task_id: str) -> None:
@@ -153,10 +163,11 @@ class Repository:
     def start_run(self, task_id: str) -> str:
         self.get_task(task_id)
         run_id = uuid.uuid4().hex
-        self._connection.execute(
-            "INSERT INTO task_runs(id, task_id, started_at) VALUES (?, ?, ?)",
-            (run_id, task_id, _now()),
-        )
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO task_runs(id, task_id, started_at) VALUES (?, ?, ?)",
+                (run_id, task_id, _now()),
+            )
         return run_id
 
     def finish_run(
@@ -166,14 +177,15 @@ class Repository:
         error: str | None = None,
         seat_number: int | None = None,
     ) -> None:
-        self._connection.execute(
-            """
-            UPDATE task_runs
-            SET finished_at=?, result=?, last_error=?, seat_number=?
-            WHERE id=?
-            """,
-            (_now(), result, error, seat_number, run_id),
-        )
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE task_runs
+                SET finished_at=?, result=?, last_error=?, seat_number=?
+                WHERE id=?
+                """,
+                (_now(), result, error, seat_number, run_id),
+            )
 
     def finish_unfinished_runs(self, error: str) -> int:
         with self._lock:
@@ -188,17 +200,18 @@ class Repository:
         return cursor.rowcount
 
     def get_latest_run(self, task_id: str) -> dict[str, Any] | None:
-        row = self._connection.execute(
-            """
-            SELECT id, task_id, started_at, finished_at, result, last_error,
-                   seat_number
-            FROM task_runs
-            WHERE task_id=?
-            ORDER BY started_at DESC
-            LIMIT 1
-            """,
-            (task_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT id, task_id, started_at, finished_at, result, last_error,
+                       seat_number
+                FROM task_runs
+                WHERE task_id=?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
         return dict(row) if row is not None else None
 
     def record_reservation(
@@ -209,39 +222,107 @@ class Repository:
         verified: bool,
     ) -> str:
         reservation_id = uuid.uuid4().hex
-        self._connection.execute(
-            "INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                reservation_id,
-                task_id,
-                run_id,
-                seat_number,
-                int(verified),
-                _now(),
-            ),
-        )
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    reservation_id,
+                    task_id,
+                    run_id,
+                    seat_number,
+                    int(verified),
+                    _now(),
+                ),
+            )
         return reservation_id
 
     def list_reservations(self) -> list[dict[str, Any]]:
-        rows = self._connection.execute(
-            "SELECT * FROM reservations ORDER BY created_at DESC"
-        ).fetchall()
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM reservations ORDER BY created_at DESC"
+            ).fetchall()
         return [dict(row) for row in rows]
 
+    def add_task_event(
+        self,
+        task_id: str,
+        stage: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> str:
+        self.get_task(task_id)
+        event_id = uuid.uuid4().hex
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO task_events
+                    (id, task_id, stage, message, details_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    task_id,
+                    stage,
+                    message,
+                    json.dumps(details or {}, ensure_ascii=False),
+                    _now(),
+                ),
+            )
+        return event_id
+
+    def list_task_events(
+        self, task_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT id, task_id, stage, message, details_json, created_at
+                FROM task_events
+                WHERE task_id=?
+                ORDER BY rowid DESC
+                LIMIT ?
+                """,
+                (task_id, limit),
+            ).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            try:
+                event["details"] = json.loads(event.pop("details_json"))
+            except (TypeError, json.JSONDecodeError):
+                event["details"] = {}
+            events.append(event)
+        return events
+
+    def count_task_events(self, task_id: str, stage: str) -> int:
+        self.get_task(task_id)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS event_count
+                FROM task_events
+                WHERE task_id=? AND stage=?
+                """,
+                (task_id, stage),
+            ).fetchone()
+        return int(row["event_count"])
+
     def set_setting(self, key: str, value: str) -> None:
-        self._connection.execute(
-            """
-            INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value,
-                updated_at=excluded.updated_at
-            """,
-            (key, value, _now()),
-        )
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                (key, value, _now()),
+            )
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
-        row = self._connection.execute(
-            "SELECT value FROM settings WHERE key=?", (key,)
-        ).fetchone()
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            ).fetchone()
         return default if row is None else str(row["value"])
 
 

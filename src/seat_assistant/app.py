@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
+import queue
 import secrets
+import shutil
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -62,15 +63,23 @@ def create_app(
         visible = os.getenv("ZJU_SEAT_RESERVATION_VISIBLE", "").casefold()
         return visible in {"1", "true", "yes", "on"}
 
-    def make_adapter(headless: bool | None = None) -> PlaywrightAdapter:
+    def make_adapter(
+        headless: bool | None = None,
+        profile_directory: Path | None = None,
+    ) -> PlaywrightAdapter:
         if adapter_factory is not None:
             return adapter_factory()
         visible = reservation_browser_visible()
         return PlaywrightAdapter(
-            profile_directory=data_directory / "browser-profile",
+            profile_directory=profile_directory or data_directory / "browser-profile",
             diagnostics_directory=data_directory / "diagnostics",
             headless=False if headless is None else headless,
             background_window=(not visible) if headless is None else False,
+        )
+
+    def make_reservation_adapter(task_id: str) -> PlaywrightAdapter:
+        return make_adapter(
+            profile_directory=_prepare_reservation_profile(data_directory, task_id)
         )
 
     def make_login_adapter() -> PlaywrightAdapter:
@@ -89,6 +98,8 @@ def create_app(
     consecutive_errors: dict[str, int] = {}
     active_run_lock = threading.Lock()
     active_run_task_ids: set[str] = set()
+    reservation_workers: dict[str, _ReservationWorker] = {}
+    reservation_worker_lock = threading.Lock()
 
     def task_payload(task: StoredTask) -> dict[str, Any]:
         next_check_at = next_attempt.get(task.id)
@@ -98,48 +109,87 @@ def create_app(
             task,
             last_run=repository.get_latest_run(task.id),
             next_check_at=next_check_at,
+            events=repository.list_task_events(task.id),
+            scan_count=repository.count_task_events(task.id, "scan_complete"),
             submission_enabled=submission_enabled(),
         )
 
     def run_task_with_adapter(
         task_id: str, adapter: PlaywrightAdapter
     ) -> dict[str, Any]:
-        try:
-            engine = ExecutionEngine(
-                repository,
-                adapter,
-                submission_enabled=submission_enabled(),
-            )
-            result = engine.run_once(task_id)
-            task = repository.get_task(task_id)
-            if result.outcome.task_state is TaskState.SUCCEEDED:
-                _safe_notify(notifier.notify_success, task, result.seat)
-            elif result.outcome.task_state is TaskState.FAILED:
-                _safe_notify(notifier.notify_error, task, result.message)
-            return {
-                "outcome": result.outcome.value,
-                "seat": result.seat,
-                "message": result.message,
-            }
-        finally:
-            adapter.close()
+        engine = ExecutionEngine(
+            repository,
+            adapter,
+            submission_enabled=submission_enabled(),
+        )
+        result = engine.run_once(task_id)
+        task = repository.get_task(task_id)
+        if result.outcome.task_state is TaskState.SUCCEEDED:
+            _safe_notify(notifier.notify_success, task, result.seat)
+        elif (
+            result.outcome is ReservationOutcome.LOGIN_REQUIRED
+            and task.state is not TaskState.STOPPED
+        ):
+            _safe_notify(notifier.notify_error, task, result.message)
+        return {
+            "outcome": result.outcome.value,
+            "seat": result.seat,
+            "message": result.message,
+        }
+
+    def get_reservation_worker(task_id: str) -> "_ReservationWorker":
+        with reservation_worker_lock:
+            worker = reservation_workers.get(task_id)
+            if worker is None:
+                worker = _ReservationWorker(
+                    lambda: make_reservation_adapter(task_id), run_task_with_adapter
+                )
+                reservation_workers[task_id] = worker
+            return worker
+
+    def close_reservation_adapter(task_id: str | None = None) -> None:
+        with reservation_worker_lock:
+            if task_id is None:
+                workers = list(reservation_workers.values())
+                reservation_workers.clear()
+            else:
+                worker = reservation_workers.pop(task_id, None)
+                workers = [] if worker is None else [worker]
+        for worker in workers:
+            worker.close()
+
+    def stop_other_tasks_after_success(winner_task_id: str) -> None:
+        for item in repository.list_tasks():
+            if item.id == winner_task_id:
+                continue
+            if item.state not in TERMINAL_STATES:
+                try:
+                    repository.set_task_state(item.id, TaskState.STOPPED)
+                except ValueError:
+                    pass
+            next_attempt.pop(item.id, None)
+            consecutive_errors.pop(item.id, None)
+            close_reservation_adapter(item.id)
 
     def run_task(task_id: str) -> dict[str, Any]:
         with active_run_lock:
-            if active_run_task_ids:
+            if task_id in active_run_task_ids:
                 return {
                     "outcome": "in_progress",
                     "seat": None,
-                    "message": "another detection is already running",
+                    "message": "this task is already running",
                 }
             active_run_task_ids.add(task_id)
         try:
-            result = run_task_with_adapter(task_id, make_adapter())
+            result = get_reservation_worker(task_id).run(task_id)
             if (
                 result["outcome"] == ReservationOutcome.LOGIN_REQUIRED.value
                 and repository.get_setting("account_status") == "connected"
+                and repository.get_task(task_id).state is not TaskState.STOPPED
             ):
                 repository.set_setting("account_status", "not_connected")
+            if result["outcome"] == ReservationOutcome.SUCCESS.value:
+                stop_other_tasks_after_success(task_id)
             return result
         finally:
             with active_run_lock:
@@ -170,21 +220,6 @@ def create_app(
                 continue
             if result["outcome"] == "failure":
                 consecutive_errors[task.id] = consecutive_errors.get(task.id, 0) + 1
-                if consecutive_errors[task.id] >= task.config.max_consecutive_errors:
-                    try:
-                        repository.set_task_state(
-                            task.id,
-                            TaskState.FAILED,
-                            "maximum consecutive errors reached",
-                        )
-                        _safe_notify(
-                            notifier.notify_error,
-                            task,
-                            "maximum consecutive errors reached",
-                        )
-                    except ValueError:
-                        pass
-                    continue
                 try:
                     repository.set_task_state(task.id, TaskState.SCHEDULED)
                 except ValueError:
@@ -199,13 +234,7 @@ def create_app(
                 except ValueError:
                     pass
                 continue
-            delay = random.uniform(
-                task.config.refresh_min_seconds,
-                task.config.refresh_max_seconds,
-            )
-            next_attempt[task.id] = datetime.fromtimestamp(
-                after_run.timestamp() + delay, tz=after_run.tzinfo
-            )
+            next_attempt[task.id] = after_run
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -224,12 +253,14 @@ def create_app(
         yield
         if scheduler is not None:
             scheduler.shutdown(wait=False)
+        close_reservation_adapter()
         repository.close()
 
     app = FastAPI(title="浙大图书馆座位助手", lifespan=lifespan)
     app.state.repository = repository
     app.state.access_token = token
     app.state.run_task = run_task
+    app.state.tick = tick
     app.mount(
         "/static",
         StaticFiles(directory=PACKAGE_DIRECTORY / "static"),
@@ -296,6 +327,7 @@ def create_app(
             repository.delete_task(task_id)
             next_attempt.pop(task_id, None)
             consecutive_errors.pop(task_id, None)
+            close_reservation_adapter(task_id)
         except KeyError:
             raise HTTPException(404, "task not found")
         return Response(status_code=204)
@@ -325,6 +357,8 @@ def create_app(
             if task.state not in TERMINAL_STATES:
                 repository.set_task_state(task_id, TaskState.STOPPED)
             next_attempt.pop(task_id, None)
+            consecutive_errors.pop(task_id, None)
+            close_reservation_adapter(task_id)
             return task_payload(repository.get_task(task_id))
         except KeyError:
             raise HTTPException(404, "task not found")
@@ -342,6 +376,8 @@ def create_app(
 
     @app.post("/api/account/login")
     async def account_login(background: BackgroundTasks) -> dict[str, str]:
+        close_reservation_adapter()
+        _clear_reservation_profiles(data_directory)
         login_check_event.clear()
         background.add_task(
             _login_worker, repository, make_login_adapter, login_check_event
@@ -416,6 +452,8 @@ def _task_to_dict(
     task: StoredTask,
     last_run: dict[str, Any] | None = None,
     next_check_at: datetime | None = None,
+    events: list[dict[str, Any]] | None = None,
+    scan_count: int | None = None,
     submission_enabled: bool = False,
 ) -> dict[str, Any]:
     config = asdict(task.config)
@@ -435,6 +473,12 @@ def _task_to_dict(
         blockers.append("自动提交总开关未开启")
     if task.config.observation_mode:
         blockers.append("任务仍处于观察模式")
+    progress_events = events or []
+    current_event = progress_events[0] if progress_events else None
+    recent_scan_count = sum(
+        1 for event in progress_events if event["stage"] == "scan_complete"
+    )
+    seat_status = _seat_status_from_events(progress_events)
     return {
         "id": task.id,
         "state": task.state.value,
@@ -448,6 +492,15 @@ def _task_to_dict(
                 next_check_at.isoformat() if next_check_at is not None else None
             ),
         },
+        "progress": {
+            "current_stage": current_event["stage"] if current_event else None,
+            "current_message": current_event["message"] if current_event else None,
+            "scan_count": (
+                recent_scan_count if scan_count is None else scan_count
+            ),
+            "seat_status": seat_status,
+            "events": progress_events,
+        },
         "submission_policy": {
             "will_submit": not blockers,
             "blockers": blockers,
@@ -457,6 +510,114 @@ def _task_to_dict(
 
 def _optional_int(value: Any) -> int | None:
     return None if value in (None, "") else int(value)
+
+
+def _prepare_reservation_profile(data_directory: Path, task_id: str) -> Path:
+    source = data_directory / "browser-profile"
+    target = data_directory / "reservation-profiles" / task_id
+    if target.exists():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.exists():
+        shutil.copytree(
+            source,
+            target,
+            ignore=shutil.ignore_patterns(
+                "Singleton*",
+                "LOCK",
+                "lockfile",
+                "*.lock",
+                "DevToolsActivePort",
+                "Crashpad",
+            ),
+        )
+    else:
+        target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _clear_reservation_profiles(data_directory: Path) -> None:
+    profiles = data_directory / "reservation-profiles"
+    if profiles.exists():
+        shutil.rmtree(profiles, ignore_errors=True)
+
+
+def _seat_status_from_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    latest_scan = next(
+        (event for event in events if event["stage"] == "scan_complete"),
+        None,
+    )
+    latest_candidate = next(
+        (event for event in events if event["stage"] == "candidate_found"),
+        None,
+    )
+    scan_details = latest_scan["details"] if latest_scan else {}
+    candidate_details = latest_candidate["details"] if latest_candidate else {}
+    return {
+        "available_count": scan_details.get("available_count"),
+        "available_seats": scan_details.get("available_seats", []),
+        "candidate_seat": candidate_details.get("seat"),
+    }
+
+
+class _ReservationRunRequest:
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.done = threading.Event()
+        self.result: dict[str, Any] | None = None
+        self.error: BaseException | None = None
+
+
+class _ReservationWorker:
+    def __init__(
+        self,
+        adapter_factory: Callable[[], PlaywrightAdapter],
+        run_with_adapter: Callable[[str, PlaywrightAdapter], dict[str, Any]],
+    ):
+        self._adapter_factory = adapter_factory
+        self._run_with_adapter = run_with_adapter
+        self._queue: queue.Queue[_ReservationRunRequest | None] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="zju-seat-reservation-browser",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def run(self, task_id: str) -> dict[str, Any]:
+        request = _ReservationRunRequest(task_id)
+        self._queue.put(request)
+        request.done.wait()
+        if request.error is not None:
+            raise request.error
+        if request.result is None:
+            raise RuntimeError("reservation worker finished without a result")
+        return request.result
+
+    def close(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=15)
+
+    def _loop(self) -> None:
+        adapter: PlaywrightAdapter | None = None
+        try:
+            while True:
+                request = self._queue.get()
+                if request is None:
+                    return
+                try:
+                    if adapter is None:
+                        adapter = self._adapter_factory()
+                    request.result = self._run_with_adapter(
+                        request.task_id, adapter
+                    )
+                except BaseException as error:
+                    request.error = error
+                finally:
+                    request.done.set()
+        finally:
+            if adapter is not None:
+                adapter.close()
 
 
 

@@ -87,6 +87,57 @@ class RepositoryTests(unittest.TestCase):
             finally:
                 repository.close()
 
+    def test_records_recent_task_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Repository(Path(directory) / "assistant.db")
+            try:
+                task_id = repository.create_task(task_config())
+
+                repository.add_task_event(task_id, "checking_login", "Checking login")
+                repository.add_task_event(
+                    task_id,
+                    "scan_complete",
+                    "Found available seats",
+                    {"available_count": 2, "candidates": [12, 95]},
+                )
+
+                events = repository.list_task_events(task_id)
+                self.assertEqual([event["stage"] for event in events], [
+                    "scan_complete",
+                    "checking_login",
+                ])
+                self.assertEqual(events[0]["message"], "Found available seats")
+                self.assertEqual(events[0]["details"]["available_count"], 2)
+                self.assertEqual(events[0]["details"]["candidates"], [12, 95])
+            finally:
+                repository.close()
+
+    def test_counts_task_events_by_stage_beyond_recent_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Repository(Path(directory) / "assistant.db")
+            try:
+                task_id = repository.create_task(task_config())
+                for index in range(25):
+                    repository.add_task_event(
+                        task_id,
+                        "scan_complete",
+                        "Scan complete",
+                        {"index": index},
+                    )
+                repository.add_task_event(task_id, "checking_login", "Checking login")
+
+                self.assertEqual(
+                    repository.count_task_events(task_id, "scan_complete"),
+                    25,
+                )
+                self.assertEqual(
+                    repository.count_task_events(task_id, "checking_login"),
+                    1,
+                )
+                self.assertEqual(len(repository.list_task_events(task_id)), 20)
+            finally:
+                repository.close()
+
 
 if __name__ == "__main__":
     unittest.main()

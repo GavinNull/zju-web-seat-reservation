@@ -114,6 +114,23 @@ class ExecutionEngineTests(unittest.TestCase):
             self.assertEqual(repository.get_task(task_id).state, TaskState.STOPPED)
             repository.close()
 
+    def test_run_once_records_progress_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Repository(Path(directory) / "assistant.db")
+            task_id = repository.create_task(config(observation_mode=True))
+            adapter = FakeAdapter(ReservationOutcome.SUCCESS, seats=(95,))
+
+            result = ExecutionEngine(repository, adapter).run_once(task_id)
+
+            self.assertEqual(result.outcome, ReservationOutcome.CANDIDATE_FOUND)
+            events = repository.list_task_events(task_id)
+            stages = [event["stage"] for event in events]
+            self.assertIn("checking_login", stages)
+            self.assertIn("scan_complete", stages)
+            self.assertIn("candidate_found", stages)
+            self.assertEqual(events[0]["details"]["seat"], 95)
+            repository.close()
+
 
 if __name__ == "__main__":
     unittest.main()

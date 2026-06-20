@@ -2,9 +2,46 @@
 setlocal
 cd /d "%~dp0"
 
+if not exist "pyproject.toml" (
+  echo This launcher must be placed in the project root directory.
+  pause
+  exit /b 1
+)
+
+if not exist ".venv\Scripts\python.exe" (
+  echo Creating Python virtual environment...
+  py -3 -m venv .venv
+  if errorlevel 1 python -m venv .venv
+  if errorlevel 1 (
+    echo Failed to create .venv. Please install Python 3.11 or newer.
+    pause
+    exit /b 1
+  )
+)
+
 if not exist ".venv\Scripts\zju-seat-assistant.exe" (
-  echo The application environment is missing.
-  echo Please follow README.md to install it first.
+  echo Installing project dependencies...
+  ".venv\Scripts\python.exe" -m pip install -e ".[test]"
+  if errorlevel 1 (
+    echo Failed to install project dependencies.
+    pause
+    exit /b 1
+  )
+)
+
+if not exist ".venv\.playwright-chromium-installed" (
+  echo Installing Playwright Chromium...
+  ".venv\Scripts\python.exe" -m playwright install chromium
+  if errorlevel 1 (
+    echo Failed to install Playwright Chromium.
+    pause
+    exit /b 1
+  )
+  echo installed > ".venv\.playwright-chromium-installed"
+)
+
+if not exist ".venv\Scripts\zju-seat-assistant.exe" (
+  echo The application command is still missing after setup.
   pause
   exit /b 1
 )

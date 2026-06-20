@@ -222,11 +222,48 @@ function detectionResultText(result) {
   }[result] || result || "检测中";
 }
 
+function progressStageText(stage) {
+  return ({
+    run_started: "开始检测",
+    checking_login: "检查登录状态",
+    login_required: "需要重新连接账号",
+    scanning: "读取座位页面",
+    scan_complete: "座位扫描完成",
+    no_matching_seat: "没有符合规则的座位",
+    candidate_found: "找到候选座位",
+    submission_skipped: "观察模式，不提交预约",
+    submitting: "正在提交预约",
+    verifying: "正在核验预约结果",
+    finished: "检测完成",
+    failed: "检测异常",
+  })[stage] || stage || "等待检测";
+}
+
+function eventDetailsText(details = {}) {
+  const parts = [];
+  if (details.available_count !== undefined) parts.push(`空余 ${details.available_count}`);
+  if (details.seat !== undefined && details.seat !== null) parts.push(`座位 ${String(details.seat).padStart(3, "0")}`);
+  if (details.observation_mode) parts.push("观察模式");
+  if (details.submission_enabled === false) parts.push("总开关关闭");
+  if (details.error) parts.push(details.error);
+  return parts.join(" · ");
+}
+
+function seatListText(seats = []) {
+  if (!seats.length) return "无";
+  const shown = seats.slice(0, 12).map(seat => String(seat).padStart(3, "0"));
+  const suffix = seats.length > shown.length ? ` 等 ${seats.length} 个` : "";
+  return `${shown.join("、")}${suffix}`;
+}
+
 function taskCard(task) {
   const config = task.config;
   const mode = config.observation_mode ? "观察模式" : "允许提交";
   const policy = task.submission_policy || {};
   const detection = task.detection || {};
+  const progress = task.progress || {};
+  const seatStatus = progress.seat_status || {};
+  const events = progress.events || [];
   const lastRun = detection.last_run;
   const activeStates = ["running", "submitting", "verifying"];
   const checking = activeStates.includes(task.state)
@@ -249,6 +286,34 @@ function taskCard(task) {
         ? `<span>检测错误</span><strong class="error">${escapeHtml(lastRun.last_error)}</strong>`
         : ""}
     </div>` : `<p class="empty">尚未执行检测</p>`;
+  const currentProgress = progress.current_stage ? `
+    <div class="progress-summary">
+      <span>当前步骤</span>
+      <strong>${escapeHtml(progressStageText(progress.current_stage))}</strong>
+      <small>${escapeHtml(progress.current_message || "")}</small>
+      <span>检测轮次</span>
+      <strong>${Number(progress.scan_count || 0)}</strong>
+      <span>当前空余</span>
+      <strong>${seatStatus.available_count ?? "--"}</strong>
+      <span>可用座位</span>
+      <strong>${escapeHtml(seatListText(seatStatus.available_seats || []))}</strong>
+      <span>候选座位</span>
+      <strong>${seatStatus.candidate_seat ? escapeHtml(String(seatStatus.candidate_seat).padStart(3, "0")) : "--"}</strong>
+    </div>` : "";
+  const eventLog = events.length ? `
+    <details class="event-log">
+      <summary>查看最近过程</summary>
+      <ol>
+        ${events.slice(0, 8).map(event => {
+          const details = eventDetailsText(event.details || {});
+          return `<li>
+            <time>${formatDetectionTime(event.created_at)}</time>
+            <strong>${escapeHtml(progressStageText(event.stage))}</strong>
+            <span>${escapeHtml(details || event.message || "")}</span>
+          </li>`;
+        }).join("")}
+      </ol>
+    </details>` : "";
   return `<article class="task">
     <div class="task-main">
       <div class="task-badges"><span class="badge">${statusText(task.state)}</span><span class="badge neutral">${mode}</span>${checking ? '<span class="badge checking"><i></i>检测中</span>' : ""}</div>
@@ -259,8 +324,10 @@ function taskCard(task) {
       ${blockers.length ? `<p class="error">不会自动预约：${blockers.map(escapeHtml).join("；")}</p>` : ""}
       ${task.last_error ? `<p class="error">${escapeHtml(task.last_error)}</p>` : ""}
       <section class="detection-status">
+        ${currentProgress}
         ${detectionDetails}
         <p class="next-check">下次检测：${formatDetectionTime(detection.next_check_at)}</p>
+        ${eventLog}
       </section>
     </div>
     <div class="actions">
@@ -333,8 +400,7 @@ function resetTaskForm() {
   document.querySelector("#seat-rules").innerHTML = "";
   document.querySelector("#form-error").textContent = "";
   const now = new Date();
-  const tomorrow = new Date(now.getTime() + 86400000);
-  taskForm.elements.reservation_date.value = localDate(tomorrow);
+  taskForm.elements.reservation_date.value = localDate(now);
   taskForm.elements.starts_at.value = localDateTime(now);
   taskForm.elements.stops_at.value = localDateTime(new Date(now.getTime() + 15 * 60000));
   addRule({priority: 1, start: 1, end: 999, order: "asc"});

@@ -175,8 +175,8 @@ class ReservationConfig:
             raise ValueError("stop time must be later than start time")
         if not self.seat_rules:
             raise ValueError("at least one seat rule is required")
-        if self.refresh_min_seconds < 8:
-            raise ValueError("refresh minimum must be at least 8 seconds")
+        if self.refresh_min_seconds < 3:
+            raise ValueError("refresh minimum must be at least 3 seconds")
         if self.refresh_max_seconds < self.refresh_min_seconds:
             raise ValueError("refresh maximum must not be below minimum")
         if self.max_consecutive_errors <= 0:

@@ -6,8 +6,8 @@
   <title>浙大图书馆座位助手</title>
   <link rel="stylesheet" href="/static/app.css?v=20260615-2">
 </head>
-<body>
-  <header>
+<body class="app-shell">
+  <header class="hero">
     <div>
       <p class="eyebrow">LOCAL CONTROL CONSOLE</p>
       <h1>浙大图书馆座位助手</h1>
@@ -113,9 +113,10 @@
       </div>
 
       <h3>检查策略</h3>
+      <p class="hint">每轮检测完成后会立即进入下一轮；不会再额外等待固定刷新间隔。</p>
       <div class="form-grid three">
-        <label>最小刷新秒数<input name="refresh_min_seconds" type="number" min="8" value="8"></label>
-        <label>最大刷新秒数<input name="refresh_max_seconds" type="number" min="8" value="15"></label>
+        <input name="refresh_min_seconds" type="hidden" value="3">
+        <input name="refresh_max_seconds" type="hidden" value="3">
         <label>最大连续错误<input name="max_consecutive_errors" type="number" min="1" value="5"></label>
       </div>
 
