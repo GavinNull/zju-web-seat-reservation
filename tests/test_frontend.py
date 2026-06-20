@@ -71,6 +71,15 @@ class FrontendContentTests(unittest.TestCase):
         self.assertIn("taskForm.elements.reservation_date.value = localDate(now)", script)
         self.assertNotIn("taskForm.elements.reservation_date.value = localDate(tomorrow)", script)
 
+    def test_new_task_defaults_to_main_library_third_floor(self) -> None:
+        script = (
+            ROOT / "src" / "seat_assistant" / "static" / "app.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('locationSelection.venues = new Set(["主馆"])', script)
+        self.assertIn('locationSelection.floors = new Set([locationKey("主馆", "三层")])', script)
+        self.assertIn('locationKey("主馆", "三层", "三层东")', script)
+
     def test_page_uses_centered_app_shell_layout(self) -> None:
         html = (
             ROOT / "src" / "seat_assistant" / "templates" / "index.html"

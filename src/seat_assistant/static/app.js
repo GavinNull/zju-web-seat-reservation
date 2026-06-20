@@ -121,10 +121,10 @@ function resetLocationSelection() {
   document.querySelector("#venue-mode").value = "single";
   document.querySelector("#floor-mode").value = "single";
   document.querySelector("#area-mode").value = "single";
-  locationSelection.venues = new Set(["基础馆"]);
-  locationSelection.floors = new Set([locationKey("基础馆", "负一层")]);
+  locationSelection.venues = new Set(["主馆"]);
+  locationSelection.floors = new Set([locationKey("主馆", "三层")]);
   locationSelection.areas = new Set([
-    locationKey("基础馆", "负一层", "负一层书库"),
+    locationKey("主馆", "三层", "三层东"),
   ]);
   renderLocationPickers();
 }
