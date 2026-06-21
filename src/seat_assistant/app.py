@@ -158,7 +158,11 @@ def create_app(
             result.outcome is ReservationOutcome.LOGIN_REQUIRED
             and task.state is not TaskState.STOPPED
         ):
-            _safe_notify(notifier.notify_error, task, result.message)
+            was_connected = (
+                repository.get_setting("account_status") == "connected"
+            )
+            if was_connected:
+                _safe_notify(notifier.notify_error, task, result.message)
         return {
             "outcome": result.outcome.value,
             "seat": result.seat,

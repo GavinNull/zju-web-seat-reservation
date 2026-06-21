@@ -71,7 +71,7 @@ class ExecutionEngine:
             self._event(
                 task_id,
                 "run_started",
-                "Started detection",
+                "开始检测",
                 {
                     "venue": task.config.venue,
                     "floor": task.config.floor,
@@ -79,14 +79,17 @@ class ExecutionEngine:
                 },
             )
 
-            self._event(task_id, "checking_login", "Checking login status")
+            self._event(task_id, "checking_login", "检查登录状态")
             if not self.adapter.check_login():
-                self._event(task_id, "login_required", "Login is required")
+                self._event(task_id, "login_required", "未登录或登录状态已过期")
                 return self._finish(
-                    task_id, run_id, ReservationOutcome.LOGIN_REQUIRED
+                    task_id,
+                    run_id,
+                    ReservationOutcome.LOGIN_REQUIRED,
+                    message='未检测到有效登录状态，请在控制台点击"连接浙大账号"',
                 )
 
-            self._event(task_id, "scanning", "Scanning seats")
+            self._event(task_id, "scanning", "正在扫描座位")
             progress_setter = self._attach_progress_reporter(task_id)
             try:
                 scan = self.adapter.scan(task.config)
@@ -96,7 +99,7 @@ class ExecutionEngine:
             self._event(
                 task_id,
                 "scan_complete",
-                "Scan complete",
+                "扫描完成",
                 {
                     "available_count": len(scan.available_seats),
                     "available_seats": list(scan.available_seats[:30]),
@@ -108,7 +111,7 @@ class ExecutionEngine:
                 self._event(
                     task_id,
                     "no_matching_seat",
-                    "No matching seat found",
+                    "未找到符合规则的座位",
                     {"available_count": len(scan.available_seats)},
                 )
                 return self._finish(
@@ -118,14 +121,20 @@ class ExecutionEngine:
             self._event(
                 task_id,
                 "candidate_found",
-                "Candidate seat found",
+                "找到候选座位",
                 {"seat": seat},
             )
             if task.config.observation_mode or not self.submission_enabled:
+                reasons = []
+                if task.config.observation_mode:
+                    reasons.append("任务处于观察模式")
+                if not self.submission_enabled:
+                    reasons.append("自动提交总开关未开启")
+                reason_text = "；".join(reasons)
                 self._event(
                     task_id,
                     "submission_skipped",
-                    "Submission skipped by current settings",
+                    f"跳过提交：{reason_text}",
                     {
                         "seat": seat,
                         "observation_mode": task.config.observation_mode,
@@ -137,14 +146,14 @@ class ExecutionEngine:
                     run_id,
                     ReservationOutcome.CANDIDATE_FOUND,
                     seat=seat,
-                    message="candidate found; submission is disabled",
+                    message=f"找到候选座位 {seat}，{reason_text}",
                 )
 
             self.repository.set_task_state(task_id, TaskState.SUBMITTING)
-            self._event(task_id, "submitting", "Submitting reservation", {"seat": seat})
+            self._event(task_id, "submitting", "正在提交预约", {"seat": seat})
             outcome = self.adapter.submit(task.config, seat)
             self.repository.set_task_state(task_id, TaskState.VERIFYING)
-            self._event(task_id, "verifying", "Verifying reservation", {"seat": seat})
+            self._event(task_id, "verifying", "正在核验预约结果", {"seat": seat})
             if outcome is ReservationOutcome.SUCCESS:
                 verified = self.adapter.verify_current_reservation(
                     task.config, seat
@@ -158,19 +167,27 @@ class ExecutionEngine:
             self._event(
                 task_id,
                 "finished",
-                "Detection finished",
+                "检测完成",
                 {"outcome": outcome.value, "seat": seat},
             )
             return self._finish(task_id, run_id, outcome, seat=seat)
         except Exception as error:
             if "login required" in str(error).casefold():
-                self._event(task_id, "login_required", "Login is required")
+                self._event(
+                    task_id,
+                    "login_required",
+                    "检测到登录页面，登录状态已过期",
+                )
                 if run_id is not None:
                     return self._finish(
-                        task_id, run_id, ReservationOutcome.LOGIN_REQUIRED
+                        task_id,
+                        run_id,
+                        ReservationOutcome.LOGIN_REQUIRED,
+                        message="检测过程中跳转到登录页面，请在控制台重新连接浙大账号",
                     )
                 return ExecutionResult(
-                    ReservationOutcome.LOGIN_REQUIRED, message=str(error)
+                    ReservationOutcome.LOGIN_REQUIRED,
+                    message="检测过程中跳转到登录页面，请在控制台重新连接浙大账号",
                 )
             self._event(
                 task_id,

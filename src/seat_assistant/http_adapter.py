@@ -137,7 +137,10 @@ class HttpSessionAdapter:
             token, area, date_str, config.time_slot
         )
         if segment is None:
-            return ScanResult((), f"no segment found for {date_str} {config.time_slot}")
+            return ScanResult(
+                (),
+                f'图书馆API未返回 {date_str} {config.time_slot} 的可预约时段',
+            )
 
         self._last_segment = segment
         seats, seat_map = self._get_seats(
@@ -146,7 +149,7 @@ class HttpSessionAdapter:
         self._seat_id_map = seat_map
 
         if not seats:
-            return ScanResult((), "no available seat")
+            return ScanResult((), "当前时段无可选座位")
 
         return ScanResult(tuple(sorted(set(seats))), "http scan")
 
@@ -345,22 +348,31 @@ class HybridReservationAdapter:
 
     def scan(self, config: ReservationConfig) -> ScanResult:
         try:
-            self._progress("http_scan", "Scanning seats over HTTP")
+            self._progress("http_scan", "HTTP 扫描座位")
             result = self.http_adapter.scan(config)
             self._progress(
                 "scan_complete",
-                "HTTP scan complete",
+                "HTTP 扫描完成",
                 {
                     "available_count": len(result.available_seats),
                     "available_seats": list(result.available_seats[:30]),
                     "message": result.message,
                 },
             )
-            return result
+            if result.available_seats:
+                return result
+            # HTTP returned zero seats — fall back to browser DOM scan which
+            # may surface richer error context (e.g. actual page messages).
+            self._progress(
+                "http_scan_fallback",
+                "HTTP 返回空座位列表，回退浏览器扫描",
+                {"http_message": result.message},
+            )
+            return self.browser_adapter.scan(config)
         except Exception as error:
             self._progress(
                 "http_scan_fallback",
-                "HTTP scan unavailable; falling back to browser",
+                "HTTP 扫描不可用，回退浏览器扫描",
                 {"error": str(error)},
             )
             return self.browser_adapter.scan(config)
@@ -395,6 +407,15 @@ class HybridReservationAdapter:
                 {"error": str(error), "seat": seat},
             )
 
+        # Navigate browser to seat page before DOM submit fallback.
+        # submit_via_proxy() may have left the browser on the HOME page,
+        # so _select_seat() would fail with "seat X is no longer visible".
+        self._progress(
+            "http_submit_fallback_scan",
+            "导航浏览器到座位页面后重试提交",
+            {"seat": seat},
+        )
+        self.browser_adapter.scan(config)
         return self.browser_adapter.submit(config, seat)
 
     def verify_current_reservation(

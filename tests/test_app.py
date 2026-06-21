@@ -1700,6 +1700,61 @@ class AppTests(unittest.TestCase):
                 response = app.state.run_task(created.json()["id"])
 
         self.assertEqual(response["outcome"], "login_required")
+        # When account was never connected, no notification fires — the
+        # task card shows "等待登录" status which is guidance enough.
+        self.assertEqual(notifier.errors, [])
+
+    def test_run_once_notifies_when_login_expires(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.errors = []
+
+            def notify_success(self, task, seat: int | None) -> None:
+                raise AssertionError("success notification was not expected")
+
+            def notify_timeout(self, task) -> None:
+                raise AssertionError("timeout notification was not expected")
+
+            def notify_error(self, task, message: str) -> None:
+                self.errors.append((task.config.name, message))
+
+        class LoginRequiredAdapter:
+            def close(self) -> None:
+                pass
+
+            def check_login(self) -> bool:
+                return False
+
+            def scan(self, config):
+                raise AssertionError("scan should not run")
+
+            def submit(self, config, seat):
+                raise AssertionError("submit should not run")
+
+            def verify_current_reservation(self, config, seat):
+                raise AssertionError("verify should not run")
+
+        notifier = FakeNotifier()
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(
+                data_directory=Path(directory),
+                access_token="test-token",
+                enable_scheduler=False,
+                adapter_factory=LoginRequiredAdapter,
+                desktop_notifier=notifier,
+            )
+            # Simulate user was previously logged in
+            app.state.repository.set_setting("account_status", "connected")
+            with TestClient(app) as client:
+                headers = {"Authorization": "Bearer test-token"}
+                created = client.post(
+                    "/api/tasks", json=TASK, headers=headers
+                )
+
+                response = app.state.run_task(created.json()["id"])
+
+        self.assertEqual(response["outcome"], "login_required")
+        # When account WAS connected, session expiry triggers notification
         self.assertEqual(notifier.errors, [("Morning", response["message"])])
 
     def test_stopped_task_login_required_does_not_clear_account(self) -> None:
