@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .domain import (
     ReservationConfig,
@@ -87,7 +87,12 @@ class ExecutionEngine:
                 )
 
             self._event(task_id, "scanning", "Scanning seats")
-            scan = self.adapter.scan(task.config)
+            progress_setter = self._attach_progress_reporter(task_id)
+            try:
+                scan = self.adapter.scan(task.config)
+            finally:
+                if progress_setter is not None:
+                    progress_setter(None)
             self._event(
                 task_id,
                 "scan_complete",
@@ -158,6 +163,15 @@ class ExecutionEngine:
             )
             return self._finish(task_id, run_id, outcome, seat=seat)
         except Exception as error:
+            if "login required" in str(error).casefold():
+                self._event(task_id, "login_required", "Login is required")
+                if run_id is not None:
+                    return self._finish(
+                        task_id, run_id, ReservationOutcome.LOGIN_REQUIRED
+                    )
+                return ExecutionResult(
+                    ReservationOutcome.LOGIN_REQUIRED, message=str(error)
+                )
             self._event(
                 task_id,
                 "failed",
@@ -191,6 +205,23 @@ class ExecutionEngine:
             self.repository.add_task_event(task_id, stage, message, details)
         except Exception:
             return
+
+    def _attach_progress_reporter(
+        self, task_id: str
+    ) -> Callable[[Callable[..., None] | None], None] | None:
+        setter = getattr(self.adapter, "set_progress_reporter", None)
+        if not callable(setter):
+            return None
+
+        def report(
+            stage: str,
+            message: str,
+            details: dict[str, object] | None = None,
+        ) -> None:
+            self._event(task_id, stage, message, details)
+
+        setter(report)
+        return setter
 
     def _finish(
         self,

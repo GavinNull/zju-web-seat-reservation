@@ -9,9 +9,10 @@ import secrets
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,12 +31,15 @@ from .domain import (
     TERMINAL_STATES,
 )
 from .engine import ExecutionEngine
+from .http_adapter import HybridReservationAdapter, HttpSessionAdapter
+from .http_endpoints import endpoints_from_environment
 from .storage import Repository, StoredTask
 
 
 PACKAGE_DIRECTORY = Path(__file__).parent
 LOGIN_POLL_SECONDS = 20
 LOGIN_TIMEOUT_SECONDS = 600
+MAX_PARALLEL_TASKS = 4
 
 
 def create_app(
@@ -63,6 +67,10 @@ def create_app(
         visible = os.getenv("ZJU_SEAT_RESERVATION_VISIBLE", "").casefold()
         return visible in {"1", "true", "yes", "on"}
 
+    def http_submit_enabled() -> bool:
+        enabled = os.getenv("ZJU_SEAT_HTTP_SUBMIT", "").casefold()
+        return enabled in {"1", "true", "yes", "on"}
+
     def make_adapter(
         headless: bool | None = None,
         profile_directory: Path | None = None,
@@ -77,9 +85,27 @@ def create_app(
             background_window=(not visible) if headless is None else False,
         )
 
-    def make_reservation_adapter(task_id: str) -> PlaywrightAdapter:
-        return make_adapter(
+    def make_reservation_adapter(task_id: str) -> Any:
+        browser_adapter = make_adapter(
             profile_directory=_prepare_reservation_profile(data_directory, task_id)
+        )
+        endpoints = endpoints_from_environment()
+        if endpoints is None:
+            return browser_adapter
+
+        def token_provider() -> str:
+            token = browser_adapter.extract_token()
+            return token or ""
+
+        http = HttpSessionAdapter(
+            endpoints,
+            token_provider=token_provider,
+        )
+        return HybridReservationAdapter(
+            browser_adapter,
+            http,
+            endpoints,
+            http_submit_enabled=http_submit_enabled(),
         )
 
     def make_login_adapter() -> PlaywrightAdapter:
@@ -100,6 +126,10 @@ def create_app(
     active_run_task_ids: set[str] = set()
     reservation_workers: dict[str, _ReservationWorker] = {}
     reservation_worker_lock = threading.Lock()
+    scheduler_executor = ThreadPoolExecutor(
+        max_workers=MAX_PARALLEL_TASKS,
+        thread_name_prefix="zju-seat-scheduler",
+    )
 
     def task_payload(task: StoredTask) -> dict[str, Any]:
         next_check_at = next_attempt.get(task.id)
@@ -114,9 +144,7 @@ def create_app(
             submission_enabled=submission_enabled(),
         )
 
-    def run_task_with_adapter(
-        task_id: str, adapter: PlaywrightAdapter
-    ) -> dict[str, Any]:
+    def run_task_with_adapter(task_id: str, adapter: Any) -> dict[str, Any]:
         engine = ExecutionEngine(
             repository,
             adapter,
@@ -171,29 +199,108 @@ def create_app(
             consecutive_errors.pop(item.id, None)
             close_reservation_adapter(item.id)
 
-    def run_task(task_id: str) -> dict[str, Any]:
+    def stop_all_reservation_tasks() -> int:
+        stopped = 0
+        for item in repository.list_tasks():
+            if item.state not in TERMINAL_STATES:
+                try:
+                    repository.set_task_state(item.id, TaskState.STOPPED)
+                    stopped += 1
+                except ValueError:
+                    pass
+            next_attempt.pop(item.id, None)
+            consecutive_errors.pop(item.id, None)
+        close_reservation_adapter()
+        return stopped
+
+    def _mark_task_active(task_id: str) -> bool:
         with active_run_lock:
             if task_id in active_run_task_ids:
-                return {
-                    "outcome": "in_progress",
-                    "seat": None,
-                    "message": "this task is already running",
-                }
+                return False
             active_run_task_ids.add(task_id)
+            return True
+
+    def _clear_task_active(task_id: str) -> None:
+        with active_run_lock:
+            active_run_task_ids.discard(task_id)
+
+    def _in_progress_result() -> dict[str, Any]:
+        return {
+            "outcome": "in_progress",
+            "seat": None,
+            "message": "this task is already running",
+        }
+
+    def _run_marked_task(task_id: str) -> dict[str, Any]:
+        result = get_reservation_worker(task_id).run(task_id)
+        if (
+            result["outcome"] == ReservationOutcome.LOGIN_REQUIRED.value
+            and repository.get_setting("account_status") == "connected"
+            and repository.get_task(task_id).state is not TaskState.STOPPED
+        ):
+            repository.set_setting("account_status", "not_connected")
+        if result["outcome"] == ReservationOutcome.SUCCESS.value:
+            stop_other_tasks_after_success(task_id)
+        return result
+
+    def run_task(task_id: str) -> dict[str, Any]:
+        if not _mark_task_active(task_id):
+            return _in_progress_result()
         try:
-            result = get_reservation_worker(task_id).run(task_id)
-            if (
-                result["outcome"] == ReservationOutcome.LOGIN_REQUIRED.value
-                and repository.get_setting("account_status") == "connected"
-                and repository.get_task(task_id).state is not TaskState.STOPPED
-            ):
-                repository.set_setting("account_status", "not_connected")
-            if result["outcome"] == ReservationOutcome.SUCCESS.value:
-                stop_other_tasks_after_success(task_id)
+            return _run_marked_task(task_id)
+        finally:
+            _clear_task_active(task_id)
+
+    def _finish_scheduled_task(
+        task_id: str, stops_at: datetime, result: dict[str, Any]
+    ) -> None:
+        if result["outcome"] == "in_progress":
+            return
+        task = repository.get_task(task_id)
+        if task.state is TaskState.STOPPED:
+            next_attempt.pop(task_id, None)
+            consecutive_errors.pop(task_id, None)
+            return
+        if result["outcome"] == "failure":
+            consecutive_errors[task_id] = consecutive_errors.get(task_id, 0) + 1
+            try:
+                repository.set_task_state(task_id, TaskState.SCHEDULED)
+            except ValueError:
+                pass
+        else:
+            consecutive_errors[task_id] = 0
+        after_run = datetime.now().astimezone()
+        if after_run >= stops_at:
+            try:
+                repository.set_task_state(task_id, TaskState.TIMED_OUT)
+                _safe_notify(notifier.notify_timeout, task)
+            except ValueError:
+                pass
+            return
+        if result["outcome"] == "failure":
+            retry_seconds = max(3.0, task.config.refresh_min_seconds)
+            next_attempt[task_id] = after_run + timedelta(seconds=retry_seconds)
+        else:
+            next_attempt[task_id] = after_run
+
+    def _run_scheduled_task(task_id: str, stops_at: datetime) -> dict[str, Any]:
+        try:
+            result = _run_marked_task(task_id)
+            _finish_scheduled_task(task_id, stops_at, result)
             return result
         finally:
-            with active_run_lock:
-                active_run_task_ids.discard(task_id)
+            _clear_task_active(task_id)
+
+    def _dispatch_scheduled_task(task_id: str, stops_at: datetime) -> bool:
+        with active_run_lock:
+            if (
+                task_id in active_run_task_ids
+                or len(active_run_task_ids) >= MAX_PARALLEL_TASKS
+            ):
+                return False
+            active_run_task_ids.add(task_id)
+        scheduler_executor.submit(_run_scheduled_task, task_id, stops_at)
+        return True
 
     def tick() -> None:
         now = datetime.now().astimezone()
@@ -211,30 +318,7 @@ def create_app(
                 continue
             if now < starts_at or now < next_attempt.get(task.id, starts_at):
                 continue
-            result = run_task(task.id)
-            if result["outcome"] == "in_progress":
-                continue
-            if repository.get_task(task.id).state is TaskState.STOPPED:
-                next_attempt.pop(task.id, None)
-                consecutive_errors.pop(task.id, None)
-                continue
-            if result["outcome"] == "failure":
-                consecutive_errors[task.id] = consecutive_errors.get(task.id, 0) + 1
-                try:
-                    repository.set_task_state(task.id, TaskState.SCHEDULED)
-                except ValueError:
-                    pass
-            else:
-                consecutive_errors[task.id] = 0
-            after_run = datetime.now().astimezone()
-            if after_run >= stops_at:
-                try:
-                    repository.set_task_state(task.id, TaskState.TIMED_OUT)
-                    _safe_notify(notifier.notify_timeout, task)
-                except ValueError:
-                    pass
-                continue
-            next_attempt[task.id] = after_run
+            _dispatch_scheduled_task(task.id, stops_at)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -253,6 +337,7 @@ def create_app(
         yield
         if scheduler is not None:
             scheduler.shutdown(wait=False)
+        scheduler_executor.shutdown(wait=False, cancel_futures=True)
         close_reservation_adapter()
         repository.close()
 
@@ -311,6 +396,10 @@ def create_app(
         config = await _parse_config(request)
         task_id = repository.create_task(config)
         return task_payload(repository.get_task(task_id))
+
+    @app.post("/api/tasks/stop-all")
+    async def stop_all_tasks() -> dict[str, int]:
+        return {"stopped": stop_all_reservation_tasks()}
 
     @app.put("/api/tasks/{task_id}")
     async def update_task(task_id: str, request: Request) -> dict[str, Any]:
@@ -571,8 +660,8 @@ class _ReservationRunRequest:
 class _ReservationWorker:
     def __init__(
         self,
-        adapter_factory: Callable[[], PlaywrightAdapter],
-        run_with_adapter: Callable[[str, PlaywrightAdapter], dict[str, Any]],
+        adapter_factory: Callable[[], Any],
+        run_with_adapter: Callable[[str, Any], dict[str, Any]],
     ):
         self._adapter_factory = adapter_factory
         self._run_with_adapter = run_with_adapter
@@ -599,7 +688,7 @@ class _ReservationWorker:
         self._thread.join(timeout=15)
 
     def _loop(self) -> None:
-        adapter: PlaywrightAdapter | None = None
+        adapter: Any | None = None
         try:
             while True:
                 request = self._queue.get()

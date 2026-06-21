@@ -8,12 +8,29 @@ if not exist "pyproject.toml" (
   exit /b 1
 )
 
+set "ZJU_SEAT_HTTP_ENABLED=1"
+
 set "PYTHON_CMD="
 where py >nul 2>nul
 if not errorlevel 1 set "PYTHON_CMD=py -3"
 if "%PYTHON_CMD%"=="" (
   where python >nul 2>nul
   if not errorlevel 1 set "PYTHON_CMD=python"
+)
+
+if exist ".venv\Scripts\python.exe" (
+  ".venv\Scripts\python.exe" --version >nul 2>nul
+  if errorlevel 1 (
+    echo Existing .venv is broken. Recreating it...
+    if "%PYTHON_CMD%"=="" (
+      echo Python was not found.
+      echo Please install Python 3.11 or newer from https://www.python.org/downloads/
+      echo During installation, check "Add python.exe to PATH", then run this launcher again.
+      pause
+      exit /b 1
+    )
+    rmdir /s /q ".venv"
+  )
 )
 
 if not exist ".venv\Scripts\python.exe" (

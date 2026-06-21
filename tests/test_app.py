@@ -2,6 +2,7 @@ import threading
 import tempfile
 import time
 import unittest
+import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -210,6 +211,43 @@ class AppTests(unittest.TestCase):
         self.assertFalse(adapter_class.call_args.kwargs["headless"])
         self.assertTrue(adapter_class.call_args.kwargs["background_window"])
 
+    def test_run_once_wraps_browser_with_http_adapter_when_endpoint_is_configured(
+        self,
+    ) -> None:
+        created = self.client.post(
+            "/api/tasks", json=TASK, headers=self.headers
+        )
+        task_id = created.json()["id"]
+        result = SimpleNamespace(
+            outcome=ReservationOutcome.CANDIDATE_FOUND,
+            seat=None,
+            message="ok",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "ZJU_SEAT_HTTP_ENABLED": "1",
+                "ZJU_SEAT_HTTP_BASE_URL": "https://booking.example",
+            },
+        ), patch("seat_assistant.app.PlaywrightAdapter") as adapter_class, patch(
+            "seat_assistant.app.HybridReservationAdapter"
+        ) as hybrid_class, patch(
+            "seat_assistant.app.HttpSessionAdapter"
+        ) as http_class, patch(
+            "seat_assistant.app.ExecutionEngine"
+        ) as engine_class:
+            engine_class.return_value.run_once.return_value = result
+            response = self.client.post(
+                f"/api/tasks/{task_id}/run-once", headers=self.headers
+            )
+
+        self.assertEqual(response.status_code, 200)
+        hybrid_class.assert_called_once()
+        self.assertIs(hybrid_class.call_args.args[0], adapter_class.return_value)
+        self.assertIs(hybrid_class.call_args.args[1], http_class.return_value)
+        self.assertIs(engine_class.call_args.args[1], hybrid_class.return_value)
+
     def test_connected_account_marks_not_connected_without_visible_retry(self) -> None:
         created = self.client.post(
             "/api/tasks", json=TASK, headers=self.headers
@@ -276,6 +314,233 @@ class AppTests(unittest.TestCase):
         self.assertEqual(
             [call.kwargs["background_window"] for call in adapter_class.call_args_list],
             [True],
+        )
+
+    def test_scan_stage_login_redirect_marks_task_waiting_login(self) -> None:
+        class LoginRedirectAdapter:
+            def close(self) -> None:
+                pass
+
+            def check_login(self) -> bool:
+                return True
+
+            def scan(self, config):
+                raise RuntimeError("login required")
+
+            def submit(self, config, seat):
+                raise AssertionError("submit should not run")
+
+            def verify_current_reservation(self, config, seat):
+                raise AssertionError("verify should not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(
+                data_directory=Path(directory),
+                access_token="test-token",
+                enable_scheduler=False,
+                adapter_factory=LoginRedirectAdapter,
+            )
+            with TestClient(app) as client:
+                headers = {"Authorization": "Bearer test-token"}
+                created = client.post("/api/tasks", json=TASK, headers=headers)
+                task_id = created.json()["id"]
+
+                result = app.state.run_task(task_id)
+                task = app.state.repository.get_task(task_id)
+                payload = client.get("/api/dashboard", headers=headers).json()
+
+        self.assertEqual(result["outcome"], "login_required")
+        self.assertEqual(task.state, TaskState.WAITING_LOGIN)
+        self.assertEqual(
+            payload["tasks"][0]["progress"]["current_stage"], "login_required"
+        )
+
+    def test_running_task_reports_adapter_progress_before_scan_finishes(self) -> None:
+        class ProgressAdapter:
+            instances = []
+
+            def __init__(self) -> None:
+                self.reporter = None
+                self.progress_started = threading.Event()
+                self.release = threading.Event()
+                self.instances.append(self)
+
+            def close(self) -> None:
+                self.release.set()
+
+            def set_progress_reporter(self, reporter) -> None:
+                self.reporter = reporter
+
+            def check_login(self) -> bool:
+                return True
+
+            def scan(self, config):
+                from seat_assistant.engine import ScanResult
+
+                self.reporter(
+                    "opening_reservation_page",
+                    "Opening reservation page",
+                    {"area": config.area},
+                )
+                self.progress_started.set()
+                self.release.wait(timeout=5)
+                return ScanResult(())
+
+            def submit(self, config, seat):
+                raise AssertionError("submit should not run")
+
+            def verify_current_reservation(self, config, seat):
+                raise AssertionError("verify should not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(
+                data_directory=Path(directory),
+                access_token="test-token",
+                enable_scheduler=False,
+                adapter_factory=ProgressAdapter,
+            )
+            with TestClient(app) as client:
+                headers = {"Authorization": "Bearer test-token"}
+                created = client.post("/api/tasks", json=TASK, headers=headers)
+                task_id = created.json()["id"]
+                result = {}
+                thread = threading.Thread(
+                    target=lambda: result.update(app.state.run_task(task_id))
+                )
+                thread.start()
+                deadline = time.time() + 2
+                while time.time() < deadline and not ProgressAdapter.instances:
+                    time.sleep(0.01)
+                adapter = ProgressAdapter.instances[0]
+                self.assertTrue(adapter.progress_started.wait(timeout=2))
+
+                payload = client.get("/api/dashboard", headers=headers).json()
+
+                adapter.release.set()
+                thread.join(timeout=5)
+
+        self.assertEqual(
+            payload["tasks"][0]["progress"]["current_stage"],
+            "opening_reservation_page",
+        )
+        self.assertEqual(result["outcome"], "no_seat")
+
+    def test_parallel_tasks_report_independent_adapter_progress(self) -> None:
+        class ProgressAdapter:
+            instances = []
+            lock = threading.Lock()
+
+            def __init__(self) -> None:
+                self.reporter = None
+                self.progress_started = threading.Event()
+                self.release = threading.Event()
+                with self.lock:
+                    self.instances.append(self)
+
+            def close(self) -> None:
+                self.release.set()
+
+            def set_progress_reporter(self, reporter) -> None:
+                self.reporter = reporter
+
+            def check_login(self) -> bool:
+                return True
+
+            def scan(self, config):
+                from seat_assistant.engine import ScanResult
+
+                self.reporter(
+                    "reading_seats",
+                    "Reading seats",
+                    {"area": config.area},
+                )
+                self.progress_started.set()
+                self.release.wait(timeout=5)
+                return ScanResult(())
+
+            def submit(self, config, seat):
+                raise AssertionError("submit should not run")
+
+            def verify_current_reservation(self, config, seat):
+                raise AssertionError("verify should not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(
+                data_directory=Path(directory),
+                access_token="test-token",
+                enable_scheduler=False,
+                adapter_factory=ProgressAdapter,
+            )
+            with TestClient(app) as client:
+                headers = {"Authorization": "Bearer test-token"}
+                now = datetime.now().astimezone()
+                first = client.post(
+                    "/api/tasks",
+                    json={
+                        **TASK,
+                        "name": "Area A",
+                        "area": "Area A",
+                        "starts_at": now.isoformat(),
+                        "stops_at": (now + timedelta(minutes=10)).isoformat(),
+                    },
+                    headers=headers,
+                )
+                second = client.post(
+                    "/api/tasks",
+                    json={
+                        **TASK,
+                        "name": "Area B",
+                        "area": "Area B",
+                        "starts_at": now.isoformat(),
+                        "stops_at": (now + timedelta(minutes=10)).isoformat(),
+                    },
+                    headers=headers,
+                )
+                results = []
+                first_thread = threading.Thread(
+                    target=lambda: results.append(app.state.run_task(first.json()["id"]))
+                )
+                second_thread = threading.Thread(
+                    target=lambda: results.append(app.state.run_task(second.json()["id"]))
+                )
+                first_thread.start()
+                second_thread.start()
+
+                deadline = time.time() + 2
+                while time.time() < deadline:
+                    with ProgressAdapter.lock:
+                        instances = list(ProgressAdapter.instances)
+                    if (
+                        len(instances) == 2
+                        and all(item.progress_started.is_set() for item in instances)
+                    ):
+                        break
+                    time.sleep(0.01)
+
+                payload = client.get("/api/dashboard", headers=headers).json()
+
+                for adapter in ProgressAdapter.instances:
+                    adapter.release.set()
+                first_thread.join(timeout=5)
+                second_thread.join(timeout=5)
+
+        progress_by_name = {
+            item["config"]["name"]: item["progress"] for item in payload["tasks"]
+        }
+        self.assertEqual(
+            progress_by_name["Area A"]["current_stage"], "reading_seats"
+        )
+        self.assertEqual(
+            progress_by_name["Area A"]["events"][0]["details"]["area"], "Area A"
+        )
+        self.assertEqual(
+            progress_by_name["Area B"]["current_stage"], "reading_seats"
+        )
+        self.assertEqual(
+            progress_by_name["Area B"]["events"][0]["details"]["area"], "Area B"
+        )
+        self.assertEqual(
+            sorted(item["outcome"] for item in results), ["no_seat", "no_seat"]
         )
 
     def test_run_task_skips_when_another_detection_is_active(self) -> None:
@@ -407,6 +672,72 @@ class AppTests(unittest.TestCase):
         self.assertEqual(
             sorted(item["outcome"] for item in results), ["no_seat", "no_seat"]
         )
+
+    def test_scheduler_dispatches_due_tasks_up_to_parallel_limit(self) -> None:
+        class BlockingAdapter:
+            started = []
+            release = threading.Event()
+            lock = threading.Lock()
+
+            def close(self) -> None:
+                pass
+
+            def check_login(self) -> bool:
+                with self.lock:
+                    self.started.append(threading.get_ident())
+                self.release.wait(timeout=5)
+                return True
+
+            def scan(self, config):
+                from seat_assistant.engine import ScanResult
+
+                return ScanResult(())
+
+            def submit(self, config, seat):
+                raise AssertionError("submit should not run")
+
+            def verify_current_reservation(self, config, seat):
+                raise AssertionError("verify should not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(
+                data_directory=Path(directory),
+                access_token="test-token",
+                enable_scheduler=False,
+                adapter_factory=BlockingAdapter,
+            )
+            with TestClient(app) as client:
+                headers = {"Authorization": "Bearer test-token"}
+                now = datetime.now().astimezone()
+                for index in range(5):
+                    created = client.post(
+                        "/api/tasks",
+                        json={
+                            **TASK,
+                            "name": f"Task {index}",
+                            "area": f"Area {index}",
+                            "starts_at": now.isoformat(),
+                            "stops_at": (now + timedelta(minutes=10)).isoformat(),
+                        },
+                        headers=headers,
+                    )
+                    self.assertEqual(created.status_code, 201, created.text)
+                    started = client.post(
+                        f"/api/tasks/{created.json()['id']}/start", headers=headers
+                    )
+                    self.assertEqual(started.status_code, 200, started.text)
+
+                tick_thread = threading.Thread(target=app.state.tick)
+                tick_thread.start()
+                deadline = time.time() + 2
+                while time.time() < deadline and len(BlockingAdapter.started) < 4:
+                    time.sleep(0.01)
+
+                self.assertEqual(len(BlockingAdapter.started), 4)
+
+                BlockingAdapter.release.set()
+                tick_thread.join(timeout=5)
+                self.assertFalse(tick_thread.is_alive())
 
     def test_run_task_reuses_reservation_adapter_between_scans(self) -> None:
         class ReusableAdapter:
@@ -706,6 +1037,69 @@ class AppTests(unittest.TestCase):
                 self.assertEqual(deleted.status_code, 204)
                 self.assertEqual(adapter.close_count, 1)
 
+    def test_stop_all_tasks_closes_reservation_adapters(self) -> None:
+        class ClosableAdapter:
+            instances = []
+
+            def __init__(self) -> None:
+                self.close_count = 0
+                self.instances.append(self)
+
+            def close(self) -> None:
+                self.close_count += 1
+
+            def check_login(self) -> bool:
+                return True
+
+            def scan(self, config):
+                from seat_assistant.engine import ScanResult
+
+                return ScanResult(())
+
+            def submit(self, config, seat):
+                raise AssertionError("submit should not run")
+
+            def verify_current_reservation(self, config, seat):
+                raise AssertionError("verify should not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(
+                data_directory=Path(directory),
+                access_token="test-token",
+                enable_scheduler=False,
+                adapter_factory=ClosableAdapter,
+            )
+            with TestClient(app) as client:
+                headers = {"Authorization": "Bearer test-token"}
+                now = datetime.now().astimezone()
+                task_ids = []
+                for index in range(2):
+                    created = client.post(
+                        "/api/tasks",
+                        json={
+                            **TASK,
+                            "name": f"Task {index}",
+                            "area": f"Area {index}",
+                            "starts_at": now.isoformat(),
+                            "stops_at": (now + timedelta(minutes=10)).isoformat(),
+                        },
+                        headers=headers,
+                    )
+                    task_id = created.json()["id"]
+                    task_ids.append(task_id)
+                    app.state.run_task(task_id)
+
+                response = client.post("/api/tasks/stop-all", headers=headers)
+
+                self.assertEqual(response.status_code, 200, response.text)
+                for task_id in task_ids:
+                    self.assertEqual(
+                        app.state.repository.get_task(task_id).state,
+                        TaskState.STOPPED,
+                    )
+
+        self.assertEqual([item.close_count for item in ClosableAdapter.instances], [1, 1])
+
     def test_reservation_adapter_is_used_from_one_worker_thread(self) -> None:
         class ThreadBoundAdapter:
             instances = []
@@ -994,15 +1388,81 @@ class AppTests(unittest.TestCase):
                 client.post(f"/api/tasks/{task_id}/start", headers=headers)
 
                 app.state.tick()
+                deadline = time.time() + 2
+                payload = client.get("/api/dashboard", headers=headers).json()
+                while (
+                    time.time() < deadline
+                    and payload["tasks"][0]["progress"]["current_stage"] is None
+                ):
+                    time.sleep(0.01)
+                    payload = client.get("/api/dashboard", headers=headers).json()
 
                 task = app.state.repository.get_task(task_id)
-                payload = client.get("/api/dashboard", headers=headers).json()
 
         self.assertEqual(task.state, TaskState.SCHEDULED)
         self.assertEqual(
             payload["tasks"][0]["progress"]["current_stage"], "failed"
         )
         self.assertIsNotNone(payload["tasks"][0]["detection"]["next_check_at"])
+
+    def test_scheduler_waits_before_retrying_scan_setup_failure(self) -> None:
+        class FailingAdapter:
+            def close(self) -> None:
+                pass
+
+            def check_login(self) -> bool:
+                return True
+
+            def scan(self, config):
+                raise RuntimeError("seat reservation entry did not open filter panel")
+
+            def submit(self, config, seat):
+                raise AssertionError("submit should not run")
+
+            def verify_current_reservation(self, config, seat):
+                raise AssertionError("verify should not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(
+                data_directory=Path(directory),
+                access_token="test-token",
+                enable_scheduler=False,
+                adapter_factory=FailingAdapter,
+            )
+            with TestClient(app) as client:
+                headers = {"Authorization": "Bearer test-token"}
+                now = datetime.now().astimezone()
+                created = client.post(
+                    "/api/tasks",
+                    json={
+                        **TASK,
+                        "starts_at": now.isoformat(),
+                        "stops_at": (now + timedelta(minutes=10)).isoformat(),
+                        "refresh_min_seconds": 3,
+                        "refresh_max_seconds": 3,
+                    },
+                    headers=headers,
+                )
+                task_id = created.json()["id"]
+                client.post(f"/api/tasks/{task_id}/start", headers=headers)
+
+                app.state.tick()
+                deadline = time.time() + 2
+                payload = client.get("/api/dashboard", headers=headers).json()
+                while (
+                    time.time() < deadline
+                    and payload["tasks"][0]["progress"]["current_stage"] != "failed"
+                ):
+                    time.sleep(0.01)
+                    payload = client.get("/api/dashboard", headers=headers).json()
+
+        next_check_at = datetime.fromisoformat(
+            payload["tasks"][0]["detection"]["next_check_at"]
+        )
+        self.assertGreater(
+            (next_check_at - datetime.now().astimezone()).total_seconds(),
+            1.0,
+        )
 
     def test_scheduler_continues_immediately_after_each_scan(self) -> None:
         class EmptyAdapter:

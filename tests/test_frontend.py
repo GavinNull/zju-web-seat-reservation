@@ -78,7 +78,7 @@ class FrontendContentTests(unittest.TestCase):
 
         self.assertIn('locationSelection.venues = new Set(["主馆"])', script)
         self.assertIn('locationSelection.floors = new Set([locationKey("主馆", "三层")])', script)
-        self.assertIn('locationKey("主馆", "三层", "三层东")', script)
+        self.assertIn('locationKey("主馆", "三层", "三层北")', script)
 
     def test_page_uses_centered_app_shell_layout(self) -> None:
         html = (
@@ -92,7 +92,8 @@ class FrontendContentTests(unittest.TestCase):
         self.assertIn('<header class="hero">', html)
         self.assertIn("body.app-shell", styles)
         self.assertIn("header.hero", styles)
-        self.assertIn("width: min(1280px, calc(100% - 48px))", styles)
+        self.assertIn("width: min(1120px, calc(100% - 40px))", styles)
+        self.assertIn("header, main { width: calc(100% - 24px); }", styles)
 
     def test_launcher_bootstraps_environment(self) -> None:
         launcher = (ROOT / "启动助手.bat").read_text(encoding="utf-8")

@@ -28,6 +28,12 @@ profile/
 config.json
 *.local.json
 
+# Development process and investigation files (may contain personal data)
+docs/reservation/
+docs/superpowers/
+.claude/
+最终目标.md
+
 # Editor and OS files
 .idea/
 .vscode/

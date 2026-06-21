@@ -217,6 +217,8 @@ $env:ZJU_SEAT_RESERVATION_VISIBLE = "true"
 
 本仓库的 `.gitignore` 已默认排除这些本地数据。
 
+上传 GitHub 前，请先按 [GitHub 上传检查清单](docs/GITHUB_UPLOAD_CHECKLIST.md) 和 [GitHub 发布 Workflow](docs/GITHUB_RELEASE_WORKFLOW.md) 做隐私清理、README 复查和测试验证。
+
 ## 项目结构
 
 ```text

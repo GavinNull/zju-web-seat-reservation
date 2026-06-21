@@ -6,7 +6,6 @@ let tasks = [];
 let submissionEnabled = false;
 const LOCATION_OPTIONS = {
   "主馆": {
-    "一层": [],
     "二层": ["二层南", "二层北"],
     "三层": ["三层东", "三层南", "三层北"],
     "四层": ["四层东", "四层南", "四层西", "四层北"],
@@ -24,8 +23,9 @@ const LOCATION_OPTIONS = {
     "三层": ["320外文图书阅览室", "322中外文现刊阅览室"],
   },
   "玉泉馆": {
-    "三层": [],
-    "四层": [],
+    "三层": ["三层300阅览室"],
+    "四层": ["四层401阅览室"],
+    "五层": ["五层501阅览室"],
   },
 };
 const locationSelection = {
@@ -124,7 +124,7 @@ function resetLocationSelection() {
   locationSelection.venues = new Set(["主馆"]);
   locationSelection.floors = new Set([locationKey("主馆", "三层")]);
   locationSelection.areas = new Set([
-    locationKey("主馆", "三层", "三层东"),
+    locationKey("主馆", "三层", "三层北"),
   ]);
   renderLocationPickers();
 }
@@ -175,6 +175,16 @@ async function api(path, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
+function stopAllTasksOnPageClose() {
+  fetch("/api/tasks/stop-all", {
+    method: "POST",
+    headers: headers(false),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+window.addEventListener("pagehide", stopAllTasksOnPageClose);
+
 function toast(message) {
   const node = document.querySelector("#toast");
   node.textContent = message;
@@ -219,6 +229,7 @@ function detectionResultText(result) {
     login_required: "需要重新连接浙大账号",
     ambiguous: "预约结果待人工核验",
     failure: "检测失败",
+    "http scan": "HTTP 扫描完成",
   }[result] || result || "检测中";
 }
 
@@ -227,11 +238,23 @@ function progressStageText(stage) {
     run_started: "开始检测",
     checking_login: "检查登录状态",
     login_required: "需要重新连接账号",
+    http_scan: "HTTP 扫描座位",
+    http_scan_fallback: "HTTP 扫描失败，回退浏览器",
     scanning: "读取座位页面",
+    opening_reservation_page: "进入预约页面",
+    waiting_filter_panel: "等待筛选面板",
+    selecting_filters: "选择馆舍楼层",
+    opening_area_detail: "打开区域详情",
+    opening_seat_map: "打开座位图",
+    refreshing_seat_page: "刷新当前座位页",
+    seat_page_lost: "座位页失效，重新进入",
+    reading_seats: "读取座位余量",
     scan_complete: "座位扫描完成",
     no_matching_seat: "没有符合规则的座位",
     candidate_found: "找到候选座位",
     submission_skipped: "观察模式，不提交预约",
+    http_submit: "浏览器代理提交预约",
+    http_submit_fallback: "代理提交失败，回退 UI 提交",
     submitting: "正在提交预约",
     verifying: "正在核验预约结果",
     finished: "检测完成",

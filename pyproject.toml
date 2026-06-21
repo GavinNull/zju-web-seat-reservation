@@ -10,15 +10,17 @@ requires-python = ">=3.11"
 dependencies = [
     "APScheduler>=3.10,<4",
     "FastAPI>=0.115",
+    "httpx>=0.28",
     "Jinja2>=3.1",
     "Pillow>=10",
     "playwright>=1.52",
+    "pycryptodome>=3.20",
     "python-multipart>=0.0.20",
     "uvicorn[standard]>=0.34",
 ]
 
 [project.optional-dependencies]
-test = ["httpx>=0.28", "pytest>=8"]
+test = ["pytest>=8"]
 
 [project.scripts]
 zju-seat-assistant = "seat_assistant.app:main"
@@ -28,6 +30,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+norecursedirs = ["docs", ".venv", "data", "diagnostics", ".claude"]
 
 [tool.setuptools.package-data]
 seat_assistant = ["templates/*.html", "static/*.css", "static/*.js"]
